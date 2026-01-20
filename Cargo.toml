@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/runtime",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Ondeks Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourorg/ondeks"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+crossbeam-channel = "0.5"

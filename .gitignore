@@ -1,0 +1,75 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE - VSCode
+.vscode/
+*.code-workspace
+
+# IDE - JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# IDE - Vim
+*.swp
+*.swo
+*~
+
+# IDE - Emacs
+*~
+\#*\#
+.\#*
+
+# OS - macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# OS - Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# OS - Linux
+*~
+.directory
+.Trash-*
+
+# Debugging
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Backup files
+*.bak
+*.backup
+*.tmp
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.local
+
+# Coverage reports
+tarpaulin-report.html
+coverage/
+*.gcda
+*.gcno
+*.gcov
+
+# Documentation builds
+/book/
+/doc/
+
+# Test artifacts
+test-results/
+*.profdata

@@ -1,0 +1,15 @@
+[package]
+name = "ondeks-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ondeks"
+path = "src/main.rs"
+
+[dependencies]
+ondeks-core = { path = "../core" }
+ondeks-runtime = { path = "../runtime" }
+clap = { version = "4.0", features = ["derive"] }
+rustyline = "14.0"
+anyhow = "1.0"
