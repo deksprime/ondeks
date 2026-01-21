@@ -12,4 +12,4 @@ mod error;
 mod host;
 
 pub use error::*;
-pub use host::Host;
+pub use host::{Host, HostError};
