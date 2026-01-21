@@ -21,6 +21,7 @@ impl OutputNode {
         }
     }
 
+    /// Get the unique identifier for this output node.
     pub fn id(&self) -> NodeId {
         self.id
     }

@@ -1,13 +1,17 @@
 use crate::dsp::{Buffer, Sample};
 use super::state::Transport;
-use super::time::{SampleTime, Beats};
+use super::time::SampleTime;
 
 /// Metronome configuration.
 #[derive(Debug, Clone)]
 pub struct MetronomeConfig {
+    /// Whether the metronome is enabled.
     pub enabled: bool,
+    /// Volume level (0.0 to 1.0).
     pub volume: Sample,
+    /// Number of bars for count-in before playback starts.
     pub count_in_bars: u8,
+    /// Whether to accent the downbeat (first beat of each bar).
     pub accent_downbeat: bool,
 }
 

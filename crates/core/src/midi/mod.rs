@@ -17,11 +17,26 @@ pub struct MidiEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidiMessage {
     /// Note on: (note, velocity)
-    NoteOn { note: u8, velocity: u8 },
+    NoteOn {
+        /// MIDI note number (0-127).
+        note: u8,
+        /// Note velocity (0-127).
+        velocity: u8,
+    },
     /// Note off: (note, velocity)
-    NoteOff { note: u8, velocity: u8 },
+    NoteOff {
+        /// MIDI note number (0-127).
+        note: u8,
+        /// Note velocity (0-127).
+        velocity: u8,
+    },
     /// Control change: (controller, value)
-    ControlChange { controller: u8, value: u8 },
+    ControlChange {
+        /// Controller number (0-127).
+        controller: u8,
+        /// Controller value (0-127).
+        value: u8,
+    },
 }
 
 impl MidiEvent {

@@ -114,11 +114,17 @@ pub trait AudioNode: Send {
 /// Describes a parameter exposed by a node.
 #[derive(Debug, Clone)]
 pub struct ParameterDescriptor {
+    /// Unique identifier for this parameter.
     pub id: ParameterId,
+    /// Human-readable name for this parameter.
     pub name: String,
+    /// Minimum allowed value.
     pub min: Sample,
+    /// Maximum allowed value.
     pub max: Sample,
+    /// Default value when the parameter is reset.
     pub default: Sample,
+    /// Unit of measurement for this parameter.
     pub unit: ParameterUnit,
 }
 

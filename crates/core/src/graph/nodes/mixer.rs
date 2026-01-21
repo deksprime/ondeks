@@ -25,6 +25,7 @@ impl MixerNode {
         }
     }
 
+    /// Get the unique identifier for this mixer node.
     pub fn id(&self) -> NodeId {
         self.id
     }

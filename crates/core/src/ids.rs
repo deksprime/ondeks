@@ -47,25 +47,38 @@ define_id!(AudioPoolId, "Unique identifier for an audio pool entry.");
 /// A simple color representation for UI elements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Color {
+    /// Red component (0-255).
     pub r: u8,
+    /// Green component (0-255).
     pub g: u8,
+    /// Blue component (0-255).
     pub b: u8,
 }
 
 impl Color {
+    /// Pure red color.
     pub const RED: Self = Self { r: 255, g: 0, b: 0 };
+    /// Pure green color.
     pub const GREEN: Self = Self { r: 0, g: 255, b: 0 };
+    /// Pure blue color.
     pub const BLUE: Self = Self { r: 0, g: 0, b: 255 };
+    /// Yellow color (red + green).
     pub const YELLOW: Self = Self { r: 255, g: 255, b: 0 };
+    /// Cyan color (green + blue).
     pub const CYAN: Self = Self { r: 0, g: 255, b: 255 };
+    /// Magenta color (red + blue).
     pub const MAGENTA: Self = Self { r: 255, g: 0, b: 255 };
+    /// White color (all components at maximum).
     pub const WHITE: Self = Self { r: 255, g: 255, b: 255 };
+    /// Gray color (medium brightness).
     pub const GRAY: Self = Self { r: 128, g: 128, b: 128 };
 
+    /// Create a new color from RGB components.
     pub fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
 
+    /// Create a color from a hex value (0xRRGGBB format).
     pub fn from_hex(hex: u32) -> Self {
         Self {
             r: ((hex >> 16) & 0xFF) as u8,

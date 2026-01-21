@@ -3,8 +3,11 @@ use super::time::{Beats, SampleTime};
 /// A tempo change at a specific point in time.
 #[derive(Debug, Clone)]
 pub struct TempoEvent {
+    /// Position in beats where this tempo change occurs.
     pub position: Beats,
+    /// Tempo in BPM at this position.
     pub tempo: f64,
+    /// Interpolation curve to the next tempo change.
     pub curve: TempoCurve,
 }
 

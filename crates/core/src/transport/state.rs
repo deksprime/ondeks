@@ -4,17 +4,23 @@ use super::time_signature::TimeSignature;
 /// The current state of the transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransportState {
+    /// Transport is stopped (not playing).
     #[default]
     Stopped,
+    /// Transport is playing.
     Playing,
+    /// Transport is recording.
     Recording,
 }
 
 /// Configuration for loop playback.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopRegion {
+    /// Start position of the loop in beats.
     pub start: Beats,
+    /// End position of the loop in beats.
     pub end: Beats,
+    /// Whether looping is enabled.
     pub enabled: bool,
 }
 
@@ -56,32 +62,39 @@ impl Transport {
 
     // --- State Queries ---
 
+    /// Get the current transport state.
     pub fn state(&self) -> TransportState {
         self.state
     }
 
+    /// Check if the transport is currently playing or recording.
     pub fn is_playing(&self) -> bool {
         matches!(self.state, TransportState::Playing | TransportState::Recording)
     }
 
+    /// Check if the transport is currently recording.
     pub fn is_recording(&self) -> bool {
         matches!(self.state, TransportState::Recording)
     }
 
     // --- Position ---
 
+    /// Get the current playback position in samples.
     pub fn position(&self) -> SampleTime {
         self.position
     }
 
+    /// Get the current playback position in beats.
     pub fn position_beats(&self) -> Beats {
         self.position.to_beats(self.tempo, self.sample_rate)
     }
 
+    /// Get the current playback position in seconds.
     pub fn position_seconds(&self) -> Seconds {
         self.position.to_seconds(self.sample_rate)
     }
 
+    /// Get the current playback position in bar:beat:tick format.
     pub fn position_bbt(&self) -> BarBeatTick {
         self.position_beats().to_bar_beat_tick(
             self.time_signature.numerator,
@@ -91,24 +104,29 @@ impl Transport {
 
     // --- Tempo and Time ---
 
+    /// Get the current tempo in BPM.
     pub fn tempo(&self) -> f64 {
         self.tempo
     }
 
+    /// Get the current time signature.
     pub fn time_signature(&self) -> TimeSignature {
         self.time_signature
     }
 
+    /// Get the sample rate.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
     // --- Loop ---
 
+    /// Get the loop region configuration.
     pub fn loop_region(&self) -> &LoopRegion {
         &self.loop_region
     }
 
+    /// Check if looping is enabled.
     pub fn is_looping(&self) -> bool {
         self.loop_region.enabled
     }

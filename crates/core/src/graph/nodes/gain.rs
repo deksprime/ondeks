@@ -109,9 +109,9 @@ mod tests {
             midi: &[],
             controls: &[],
         };
-        let mut output_ref: &mut Buffer = &mut output;
-        let mut outputs = NodeOutputs {
-            audio: &mut [&mut output_ref],
+        let output_ref: &mut Buffer = &mut output;
+        let outputs = NodeOutputs {
+            audio: &mut [output_ref],
             midi: &mut vec![],
         };
         
@@ -131,9 +131,9 @@ mod tests {
             midi: &[],
             controls: &[],
         };
-        let mut output_ref: &mut Buffer = &mut output;
-        let mut outputs = NodeOutputs {
-            audio: &mut [&mut output_ref],
+        let output_ref: &mut Buffer = &mut output;
+        let outputs = NodeOutputs {
+            audio: &mut [output_ref],
             midi: &mut vec![],
         };
         

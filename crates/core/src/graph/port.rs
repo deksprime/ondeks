@@ -14,16 +14,22 @@ pub enum PortType {
 /// Describes an input port on a node.
 #[derive(Debug, Clone)]
 pub struct InputPort {
+    /// Unique identifier for this port.
     pub id: PortId,
+    /// Human-readable name for this port.
     pub name: String,
+    /// Type of data this port carries.
     pub port_type: PortType,
 }
 
 /// Describes an output port on a node.
 #[derive(Debug, Clone)]
 pub struct OutputPort {
+    /// Unique identifier for this port.
     pub id: PortId,
+    /// Human-readable name for this port.
     pub name: String,
+    /// Type of data this port carries.
     pub port_type: PortType,
 }
 

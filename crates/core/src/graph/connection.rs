@@ -3,11 +3,14 @@ use crate::ids::{NodeId, PortId};
 /// Identifies a specific port on a specific node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PortAddress {
+    /// The node this port belongs to.
     pub node: NodeId,
+    /// The port identifier.
     pub port: PortId,
 }
 
 impl PortAddress {
+    /// Create a new port address.
     pub fn new(node: NodeId, port: PortId) -> Self {
         Self { node, port }
     }
@@ -16,11 +19,14 @@ impl PortAddress {
 /// A connection between two ports.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Connection {
+    /// The source port (where data comes from).
     pub source: PortAddress,
+    /// The target port (where data goes to).
     pub target: PortAddress,
 }
 
 impl Connection {
+    /// Create a new connection between two ports.
     pub fn new(source: PortAddress, target: PortAddress) -> Self {
         Self { source, target }
     }
