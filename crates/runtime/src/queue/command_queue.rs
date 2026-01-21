@@ -13,6 +13,8 @@ pub enum RuntimeCommand {
     Shutdown,
     /// Audio configuration change.
     SetAudioConfig(AudioConfig),
+    /// Play a test tone (frequency in Hz, duration in seconds).
+    PlayTestTone { frequency: f32, duration: f32 },
 }
 
 /// Error sending a command.

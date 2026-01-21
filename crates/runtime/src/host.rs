@@ -35,6 +35,12 @@ struct HostState {
     engine: Engine,
     core_state: State,
     transport: Transport,
+    // Test tone state
+    test_tone_active: bool,
+    test_tone_frequency: f32,
+    test_tone_phase: f32,
+    test_tone_samples_remaining: u64,
+    test_tone_phase_increment: f32,
 }
 
 impl Host {
@@ -56,6 +62,11 @@ impl Host {
             engine: Engine::new(),
             core_state: State::new(),
             transport: Transport::new(config.sample_rate),
+            test_tone_active: false,
+            test_tone_frequency: 440.0,
+            test_tone_phase: 0.0,
+            test_tone_samples_remaining: 0,
+            test_tone_phase_increment: 0.0,
         }));
 
         Ok(Self {
@@ -103,6 +114,13 @@ impl Host {
                     RuntimeCommand::SetAudioConfig(_) => {
                         // Configuration changes will be handled in a future phase
                     }
+                    RuntimeCommand::PlayTestTone { frequency, duration } => {
+                        host_state.test_tone_active = true;
+                        host_state.test_tone_frequency = frequency;
+                        host_state.test_tone_phase = 0.0;
+                        host_state.test_tone_samples_remaining = (duration * sample_rate as f32) as u64;
+                        host_state.test_tone_phase_increment = frequency / sample_rate as f32;
+                    }
                 }
             }
 
@@ -116,17 +134,56 @@ impl Host {
             };
 
             // Process audio graph
-            // For now, just output silence or a test tone
+            // For now, output test tone if active, otherwise silence
             // TODO: Use engine and context to process the graph in future phases
-            for sample in output.iter_mut() {
-                *sample = 0.0;
+            let num_samples = output.len() / 2; // Stereo, so divide by 2
+            let samples_to_generate = num_samples.min(host_state.test_tone_samples_remaining as usize);
+            
+            if host_state.test_tone_active && samples_to_generate > 0 {
+                // Generate sine wave
+                for i in 0..samples_to_generate {
+                    let sample_value = (host_state.test_tone_phase * 2.0 * std::f32::consts::PI).sin() * 0.3; // 0.3 amplitude to avoid clipping
+                    
+                    // Write to both left and right channels (interleaved)
+                    output[i * 2] = sample_value;     // Left
+                    output[i * 2 + 1] = sample_value; // Right
+                    
+                    // Advance phase
+                    host_state.test_tone_phase += host_state.test_tone_phase_increment;
+                    if host_state.test_tone_phase >= 1.0 {
+                        host_state.test_tone_phase -= 1.0;
+                    }
+                }
+                
+                // Fill remaining samples with silence
+                for i in samples_to_generate..num_samples {
+                    output[i * 2] = 0.0;
+                    output[i * 2 + 1] = 0.0;
+                }
+                
+                // Update remaining samples
+                host_state.test_tone_samples_remaining = host_state.test_tone_samples_remaining.saturating_sub(samples_to_generate as u64);
+                if host_state.test_tone_samples_remaining == 0 {
+                    host_state.test_tone_active = false;
+                }
+            } else {
+                // Silence
+                for sample in output.iter_mut() {
+                    *sample = 0.0;
+                }
             }
 
             // Advance transport
             host_state.transport = host_state.transport.advance((output.len() / 2) as u64);
 
-            // Send meter update
-            event_sender.send(RuntimeEvent::MeterUpdate { left: 0.0, right: 0.0 });
+            // Calculate meters (peak values for left and right channels)
+            let mut left_peak = 0.0f32;
+            let mut right_peak = 0.0f32;
+            for i in 0..num_samples {
+                left_peak = left_peak.max(output[i * 2].abs());
+                right_peak = right_peak.max(output[i * 2 + 1].abs());
+            }
+            event_sender.send(RuntimeEvent::MeterUpdate { left: left_peak, right: right_peak });
         };
 
         self.backend.start(Box::new(callback))?;
@@ -145,6 +202,12 @@ impl Host {
     /// Send a command to the audio engine.
     pub fn send_command(&self, command: Command) -> Result<(), HostError> {
         self.command_sender.send(RuntimeCommand::Core(command))
+            .map_err(|_| HostError::NotRunning)
+    }
+
+    /// Play a test tone.
+    pub fn play_test_tone(&self, frequency: f32, duration: f32) -> Result<(), HostError> {
+        self.command_sender.send(RuntimeCommand::PlayTestTone { frequency, duration })
             .map_err(|_| HostError::NotRunning)
     }
 
