@@ -12,6 +12,7 @@ pub mod dsp;
 pub mod graph;
 pub mod midi;
 pub mod mixer;
+pub mod plugin;
 pub mod project;
 pub mod session;
 pub mod transport;

@@ -2,6 +2,7 @@ use thiserror::Error;
 use crate::ids::*;
 use crate::graph::PortType;
 use crate::transport::Beats;
+use crate::plugin::PluginError;
 
 /// Errors that can occur in audio graph operations.
 #[derive(Debug, Error)]
@@ -153,6 +154,10 @@ pub enum CoreError {
     /// An error occurred in automation operations.
     #[error("Automation error: {0}")]
     Automation(#[from] AutomationError),
+
+    /// An error occurred in plugin operations.
+    #[error("Plugin error: {0}")]
+    Plugin(#[from] PluginError),
 }
 
 /// Convenience type alias.
