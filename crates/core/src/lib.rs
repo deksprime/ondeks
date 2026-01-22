@@ -6,12 +6,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod arrangement;
 pub mod automation;
 pub mod dsp;
 pub mod graph;
 pub mod midi;
 pub mod mixer;
 pub mod project;
+pub mod session;
 pub mod transport;
 
 mod command;
