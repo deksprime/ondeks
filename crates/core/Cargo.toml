@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true, optional = true }
 thiserror = { workspace = true }
+fastrand = { workspace = true }
 
 [features]
 default = []
