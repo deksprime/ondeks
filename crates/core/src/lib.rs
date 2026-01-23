@@ -14,6 +14,8 @@ pub mod midi;
 pub mod mixer;
 pub mod plugin;
 pub mod project;
+#[cfg(feature = "serde")]
+pub mod persistence;
 pub mod session;
 pub mod transport;
 
