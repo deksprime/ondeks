@@ -8,8 +8,10 @@ name = "ondeks"
 path = "src/main.rs"
 
 [dependencies]
-ondeks-core = { path = "../core" }
+ondeks-core = { path = "../core", features = ["serde"] }
 ondeks-runtime = { path = "../runtime" }
 clap = { version = "4.0", features = ["derive"] }
 rustyline = "14.0"
 anyhow = "1.0"
+serde_json = "1.0"
+dirs = "5.0"

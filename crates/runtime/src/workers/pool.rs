@@ -50,7 +50,7 @@ impl WorkerPool {
             .map(|i| {
                 let receiver = receiver.clone();
                 thread::Builder::new()
-                    .name(format!("deksound-worker-{}", i))
+                    .name(format!("ondeks-worker-{}", i))
                     .spawn(move || {
                         while let Ok(msg) = receiver.recv() {
                             match msg {
