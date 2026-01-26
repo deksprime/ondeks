@@ -5,6 +5,10 @@
 
 mod transport;
 mod project;
+mod session;
+mod arrangement;
 
 pub use transport::*;
 pub use project::*;
+pub use session::*;
+pub use arrangement::*;
