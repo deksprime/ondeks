@@ -2,8 +2,6 @@
 
 use super::registry::*;
 use crate::parser::ParsedCommand;
-use ondeks_core::transport::Beats;
-use std::path::Path;
 use std::sync::Arc;
 
 pub fn register(registry: &mut CommandRegistry) {
@@ -110,7 +108,7 @@ fn cmd_save(ctx: &mut CommandContext, cmd: &ParsedCommand) -> CommandResult {
     Ok(CommandOutput::text(format!("Saved project to: {}", path)))
 }
 
-fn cmd_export(ctx: &mut CommandContext, cmd: &ParsedCommand) -> CommandResult {
+fn cmd_export(_ctx: &mut CommandContext, cmd: &ParsedCommand) -> CommandResult {
     let path = cmd.require_arg(0, "path")?;
     
     let _start: f64 = cmd.flag("start").and_then(|s| s.parse().ok()).unwrap_or(0.0);

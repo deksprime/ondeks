@@ -1,6 +1,6 @@
 //! Session view model (clip launcher grid).
 
-use ondeks_core::{TrackId, ClipId};
+use ondeks_core::TrackId;
 use ondeks_core::session::{SlotState, LaunchQuantize};
 use ondeks_core::project::Project;
 use super::project::{TrackViewModel, ClipViewModel};

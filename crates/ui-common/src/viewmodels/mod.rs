@@ -7,8 +7,12 @@ mod transport;
 mod project;
 mod session;
 mod arrangement;
+mod mixer;
+mod piano_roll;
 
 pub use transport::*;
 pub use project::*;
 pub use session::*;
 pub use arrangement::*;
+pub use mixer::*;
+pub use piano_roll::*;
