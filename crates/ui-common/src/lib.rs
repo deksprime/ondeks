@@ -10,9 +10,13 @@ pub mod types;
 pub mod selection;
 pub mod traits;
 pub mod viewmodels;
+pub mod commands;
+pub mod history;
 
 // Re-exports
 pub use types::*;
 pub use selection::*;
 pub use traits::*;
 pub use viewmodels::*;
+pub use commands::UiCommand;
+pub use history::{History, HistoryEntry};
