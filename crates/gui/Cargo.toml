@@ -1,0 +1,34 @@
+[package]
+name = "ondeks-gui"
+version = "0.1.0"
+edition = "2021"
+description = "egui desktop application for Ondeks DAW"
+
+[[bin]]
+name = "ondeks"
+path = "src/main.rs"
+
+[dependencies]
+ondeks-core = { path = "../core" }
+ondeks-runtime = { path = "../runtime" }
+ondeks-ui-common = { path = "../ui-common" }
+
+# GUI framework
+eframe = "0.29"
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["all_loaders"] }
+egui_plot = "0.29"
+
+# Image loading for waveforms
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+
+[features]
+default = []
+persistence = ["eframe/persistence"]
