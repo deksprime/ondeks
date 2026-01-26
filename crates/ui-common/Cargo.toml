@@ -1,0 +1,15 @@
+[package]
+name = "ondeks-ui-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared UI models and view state for Ondeks DAW"
+
+[dependencies]
+ondeks-core = { path = "../core" }
+
+# Serialization (for state persistence)
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "ondeks-core/serde"]
