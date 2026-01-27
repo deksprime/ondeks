@@ -41,6 +41,8 @@ struct HostState {
     test_tone_phase: f32,
     test_tone_samples_remaining: u64,
     test_tone_phase_increment: f32,
+    // Position update throttling
+    position_update_counter: u32,
 }
 
 impl Host {
@@ -67,6 +69,7 @@ impl Host {
             test_tone_phase: 0.0,
             test_tone_samples_remaining: 0,
             test_tone_phase_increment: 0.0,
+            position_update_counter: 0,
         }));
 
         Ok(Self {
@@ -101,9 +104,17 @@ impl Host {
                         match c {
                             Command::Play => {
                                 host_state.transport = host_state.transport.play();
+                                // Notify UI of state change
+                                event_sender.send(RuntimeEvent::TransportStateChanged {
+                                    is_playing: true,
+                                });
                             }
                             Command::Stop => {
                                 host_state.transport = host_state.transport.stop();
+                                // Notify UI of state change
+                                event_sender.send(RuntimeEvent::TransportStateChanged {
+                                    is_playing: false,
+                                });
                             }
                             Command::SetTempo(bpm) => {
                                 host_state.transport = host_state.transport.set_tempo(bpm);
@@ -175,6 +186,17 @@ impl Host {
 
             // Advance transport
             host_state.transport = host_state.transport.advance((output.len() / 2) as u64);
+
+            // Send position updates periodically (every 10 buffers to avoid flooding)
+            host_state.position_update_counter += 1;
+            if host_state.position_update_counter >= 10 {
+                host_state.position_update_counter = 0;
+                let position = host_state.transport.position();
+                event_sender.send(RuntimeEvent::PositionUpdate {
+                    samples: position.0,
+                    beats: host_state.transport.position_beats().0,
+                });
+            }
 
             // Calculate meters (peak values for left and right channels)
             let mut left_peak = 0.0f32;

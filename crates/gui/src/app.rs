@@ -3,11 +3,12 @@
 use eframe::egui;
 use ondeks_runtime::Host;
 use ondeks_ui_common::{
-    Theme, Preferences, Selection, History,
+    Preferences, Selection, History,
     TransportViewModel, ProjectViewModel, MeterViewModel,
 };
 use ondeks_core::project::Project;
 use ondeks_core::transport::Transport;
+use crate::widgets::{TransportControls, PositionDisplay, TempoEditor, LevelMeter};
 
 /// The view currently displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,12 +100,26 @@ impl OndeksApp {
                         self.master_meters.update(left, right, 0.95);
                     }
                 }
-                ondeks_runtime::queue::RuntimeEvent::PositionUpdate { beats, .. } => {
+                ondeks_runtime::queue::RuntimeEvent::PositionUpdate { beats, samples } => {
                     // Update transport view model position
-                    // TODO: Get full transport state from runtime
                     self.transport_vm.position_beats = beats;
+                    self.transport_vm.position_seconds = samples as f64 / 44100.0; // TODO: Use actual sample rate
+                    
+                    // Calculate BBT from beats
+                    let beats_per_bar = self.transport_vm.time_sig_numerator as f64;
+                    let total_beats = beats;
+                    let bar = (total_beats / beats_per_bar).floor() as u32 + 1;
+                    let beat_in_bar = ((total_beats % beats_per_bar).floor() as u32 + 1) as u8;
+                    let tick = ((total_beats % 1.0) * 960.0) as u16; // 960 ticks per beat
+                    
+                    self.transport_vm.position_bbt = ondeks_core::transport::BarBeatTick {
+                        bar,
+                        beat: beat_in_bar,
+                        tick,
+                    };
                 }
                 ondeks_runtime::queue::RuntimeEvent::TransportStateChanged { is_playing } => {
+                    tracing::info!("UI: Transport state changed - is_playing: {}", is_playing);
                     self.transport_vm.is_playing = is_playing;
                 }
                 _ => {}
@@ -121,39 +136,64 @@ impl OndeksApp {
 
             ui.separator();
 
-            // Transport controls
-            if ui.button("⏮").clicked() {
-                let _ = self.host.send_command(ondeks_core::Command::Stop);
-            }
+            // Transport controls widget
+            let transport_controls = TransportControls::new(&self.transport_vm);
+            let transport_response = transport_controls.show(ui);
 
-            let play_text = if self.transport_vm.is_playing { "⏸" } else { "▶" };
-            if ui.button(play_text).clicked() {
+            // Handle transport button clicks
+            if transport_response.goto_start {
+                tracing::info!("UI: Go to start clicked");
+                let _ = self.host.send_command(ondeks_core::Command::Stop);
+                // Also reset position to start
+                self.transport_vm.position_beats = 0.0;
+            }
+            if transport_response.play_clicked {
                 if self.transport_vm.is_playing {
+                    tracing::info!("UI: Pause clicked (stopping playback)");
                     let _ = self.host.send_command(ondeks_core::Command::Stop);
                 } else {
+                    tracing::info!("UI: Play clicked");
                     let _ = self.host.send_command(ondeks_core::Command::Play);
                 }
             }
-
-            if ui.button("⏹").clicked() {
+            if transport_response.stop_clicked {
+                tracing::info!("UI: Stop clicked");
                 let _ = self.host.send_command(ondeks_core::Command::Stop);
             }
-
-            if ui.button("⏺").on_hover_text("Record").clicked() {
-                // TODO: Toggle recording
+            if transport_response.record_clicked {
+                // Toggle recording state (UI only for now)
+                self.transport_vm.is_recording = !self.transport_vm.is_recording;
+                tracing::info!("Recording toggled: {}", self.transport_vm.is_recording);
+                // TODO: Send record command to backend when available
+            }
+            if transport_response.loop_toggled {
+                // Toggle loop state
+                self.transport_vm.loop_enabled = !self.transport_vm.loop_enabled;
+                tracing::info!("Loop toggled: {}", self.transport_vm.loop_enabled);
+                // TODO: Send loop command to backend when available
+            }
+            if transport_response.metronome_toggled {
+                // Toggle metronome state
+                self.transport_vm.metronome_enabled = !self.transport_vm.metronome_enabled;
+                tracing::info!("Metronome toggled: {}", self.transport_vm.metronome_enabled);
+                // TODO: Send metronome command to backend when available
             }
 
             ui.separator();
 
-            // Position display
-            ui.monospace(&self.transport_vm.position_string());
+            // Position display widget
+            let position_display = PositionDisplay::new(&self.transport_vm);
+            let position_response = ui.add(position_display);
+            if position_response.clicked() {
+                // TODO: Toggle between time and beats display
+            }
 
             ui.separator();
 
-            // Tempo
-            ui.label("BPM:");
+            // Tempo editor widget
             let mut tempo = self.transport_vm.tempo;
-            if ui.add(egui::DragValue::new(&mut tempo).speed(0.1).range(20.0..=999.0)).changed() {
+            let tempo_editor = TempoEditor::new(&mut tempo);
+            if ui.add(tempo_editor).changed() {
                 // Update local view model immediately for responsive UI
                 self.transport_vm.tempo = tempo;
                 // Send command to runtime
@@ -170,35 +210,15 @@ impl OndeksApp {
                 ui.toggle_value(&mut self.show_mixer, "Mixer");
                 ui.toggle_value(&mut self.show_inspector, "Inspector");
 
-                // Master meters (simple bars)
-                let meter_height = 12.0;
-                let meter_width = 100.0;
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(meter_width, meter_height),
-                    egui::Sense::hover(),
-                );
-
-                let left_width = (self.master_meters.left_normalized() * meter_width).min(meter_width);
-                let right_width = (self.master_meters.right_normalized() * meter_width).min(meter_width);
-
-                ui.painter().rect_filled(
-                    rect,
-                    2.0,
-                    egui::Color32::from_gray(40),
-                );
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(rect.min, egui::vec2(left_width, meter_height / 2.0 - 1.0)),
-                    0.0,
-                    egui::Color32::from_rgb(76, 175, 80),
-                );
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(
-                        rect.min + egui::vec2(0.0, meter_height / 2.0 + 1.0),
-                        egui::vec2(right_width, meter_height / 2.0 - 1.0)
-                    ),
-                    0.0,
-                    egui::Color32::from_rgb(76, 175, 80),
-                );
+                // Master meters using the LevelMeter widget
+                let meter = LevelMeter::new(&self.master_meters)
+                    .width(6.0)
+                    .height(20.0);
+                let meter_response = ui.add(meter);
+                if meter_response.clicked() {
+                    // Reset clip indicator
+                    self.master_meters.reset_clip();
+                }
             });
         });
     }
