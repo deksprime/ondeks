@@ -107,3 +107,54 @@ On-screen piano keyboard at the bottom of the window now drives a built-in polyp
 - **QWERTY input bleeds into global egui state** — if a future text field is focused, typing into it could also play synth notes. Guard with `ui.ctx().wants_keyboard_input()` or a focus sentinel in Slice 4.
 - **Non-deterministic `fastrand` in `Oscillator::Noise`** still flagged from Slice 1+2 for P0.7 (deterministic render); unchanged by this slice.
 - **All-notes-off on panel hide / app blur** — set-diff handles widget unrender naturally (empty current set → NoteOffs), but full app-focus-loss behavior is unverified. Test when we have a bug.
+
+---
+
+## Slice 4: Track CRUD From UI
+
+- **Status:** Done (pending user verification)
+- **Started:** 2026-04-20
+- **Landed:** 2026-04-20
+- **Effort:** MEDIUM-HIGH (as estimated)
+
+### Summary
+The app now opens to a real, empty project (master + Scene 1 only — the `Bass/Lead/Drums/Vocals` demo block is gone). The "+ Track" button in the session header adds MIDI or Audio tracks. Right-clicking a track header opens a context menu with Rename (inline TextEdit), Duplicate, Delete, Move Up/Down, and a Color submenu (8-color palette). Every mutation records its inverse in `History`; Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z undo and redo cleanly, round-tripping back to the exact prior state — including preserving track IDs across undo→redo cycles so listeners (Slice 5's instrument routing, future save/load) stay stable.
+
+### Architectural decision: deferred "Engine owns Project"
+The plan (4.T2) prescribed moving `Project` into the engine so the audio thread becomes the single source of truth. That conflicts with **P0.1** — mutating `project.tracks` (e.g. `Vec::push`) allocates, and `Engine::apply_command` runs on the audio thread. Resolution options were (a) keep Project on UI thread with a dispatcher, (b) put Project behind the existing `HostState` mutex, or (c) fully event-sourced snapshots into UI. Picked (a): Project lives on the UI thread; `apply_project_command()` mutates and returns an inverse. Engine-side changes (adding/removing per-track instrument nodes) will be dispatched alongside via a distinct engine command path in Slice 5. This is documented in code with explicit comments on `OndeksApp::project` and on the `SynthNode` / `synth_node_id` shim.
+
+### Files touched
+- **New:** `ui-common/src/dispatch.rs` — `apply_project_command()` + `apply_without_outcome()`. Single dispatch point for all project mutations with undo; pure function over `&mut Project`. 7 inline unit tests covering every variant's inverse.
+- **New:** `ui-common/tests/slice4_track_crud.rs` — 7 end-to-end history tests (add/remove/rename/duplicate/move round-trips, cascaded undo, master removal rejected).
+- **Edit:** `ui-common/src/commands/project.rs` — added `ProjectCommand::RestoreTrack { track, insert_at }` (undo-only, carries a full `Box<Track>` snapshot so delete can be reversed exactly). `description()` labels wired for each variant.
+- **Edit:** `ui-common/src/lib.rs` — export the new dispatch module.
+- **Edit:** `core/src/project/project.rs` — added `insert_track_at(track, insert_at)`, `move_track(id, new_index)`, `track_index(id)`. `remove_track` now returns `(Track, usize)` so the dispatcher can capture state for undo.
+- **Edit:** `core/src/error.rs` — added `ProjectError::Unsupported(String)` for the dispatcher's deferred command branches (Save/Load/Scene CRUD, landing in later slices).
+- **Edit:** `gui/src/views/session.rs` — track-header right-click context menu, inline rename with TextEdit, "+ Track" popup with MIDI/Audio submenu, new `TrackMenuAction` enum + `SessionViewResponse` fields (`track_menu_action`, `add_track_clicked`, `rename_commit`, `rename_cancel`).
+- **Edit:** `gui/src/app.rs` — `dispatch_project_command` and `apply_ui_command_replay` helpers, `handle_undo_redo_shortcuts` (egui `consume_shortcut` for Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z), inline-rename buffer field, demo-data block deleted, undo/redo status labels in toolbar, session view wired to dispatcher.
+
+### Invariants added / reinforced
+- **P0.6 undo discipline operational** — every project-mutating command is paired with an inverse via `ApplyOutcome { undo, redo }`. The dispatcher is the one-way funnel; no code path mutates `Project` fields directly.
+- **Deterministic redo** — for commands that generate new IDs (`AddTrack`, `DuplicateTrack`), the `redo` command is a `RestoreTrack` carrying the exact track snapshot created on first execution. Undo→redo preserves track IDs bit-identically, which Slice 5 (per-track instrument nodes) will need when reattaching graph nodes to track IDs.
+- **Master track immovable / irremovable** — enforced in `Project::remove_track` (already present) and additionally in `insert_track_at` (rejects `TrackType::Master`) and `move_track` (rejects master id).
+
+### Test results
+- **325 tests pass**, zero failures (up from 311).
+- 7 new dispatcher unit tests in `ui-common/src/dispatch.rs`.
+- 7 new integration tests in `ui-common/tests/slice4_track_crud.rs`.
+- All prior Slice 1-3 and phase-1-9 tests unchanged.
+
+### Surprises / lessons
+- **Inline rename focus is quirky.** `edit_resp.request_focus()` fires every frame the widget exists, which works but can look flickery if the rename buffer's lifetime spans multiple frames. Using a buffer on `OndeksApp` (outside SessionView's transient state) keeps the TextEdit's egui-side identity stable so focus stays put. The simpler alternative (memory-based transient state inside SessionView) was tempting but broke focus tracking.
+- **`context_menu` closure can't directly mutate `SessionViewResponse`.** Borrow checker objects to the response being mutably borrowed inside the closure and read outside it. Pattern: declare a local `Option<TrackMenuAction>` in the loop body, mutate inside the closure, assign to `response.track_menu_action` after the closure returns.
+- **Redo determinism is load-bearing for future slices.** Initially I had redo just re-apply the forward command, but AddTrack → undo → redo would generate a different `NodeId`. Switched to `RestoreTrack { snapshot }` for redo-of-add. Slice 5 cares: graph nodes are keyed by `TrackId`, so those IDs need to persist through undo→redo.
+- **`ProjectError::Unsupported`** was cheaper than refactoring the Result type in the dispatcher to a custom error enum. When Save/Load/Scene-CRUD slices land, this variant will probably get replaced by real error types — flag for a small cleanup pass then.
+- **`#[allow(dead_code)]` on `SessionViewResponse::selection_changed` was tempting but skipped** — the field is there because the ShortcutMap infrastructure wants it; leaving the warning surfaces unfinished wiring so it gets wired when selection actions need it.
+
+### Follow-ups
+- **Slice 5** builds on this: when `AddTrack` runs, the engine also needs to create a per-track `SynthNode`. That's a new engine command `Command::AddInstrumentNode { track_id, kind }`. The existing default demo synth + `synth_node_id()` shim must die in the same slice (otherwise there are two synths competing for keyboard input).
+- **Scene CRUD** deferred. The dispatcher has stub arms that error with `Unsupported`.
+- **Multi-select / group operations on tracks** — the current dispatcher is per-track. Batch commands (e.g. delete 3 tracks with one undo) will want a `UiCommand::Batch(Vec<UiCommand>)` wrapper. Flag for Slice 8 piano roll where multi-select notes need the same treatment.
+- **Save/Load** still missing (Slice 7). Right now if the app crashes mid-session all work is lost; worth flagging to user when they start a real session.
+- **Color palette is fixed at 8 presets.** A proper color picker (HSV wheel or RGB sliders) is a polish slice; for now 8 is enough to distinguish tracks visually.
+- **Undo/redo description labels in toolbar are faint gray** — the labels show whatever command description last ran. Useful for debugging, possibly noisy for regular users; hide behind a preference later.

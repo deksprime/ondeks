@@ -91,6 +91,10 @@ pub enum ProjectError {
         /// Type of the target track.
         track_type: String,
     },
+
+    /// The requested operation is not yet implemented for this command variant.
+    #[error("Unsupported project operation: {0}")]
+    Unsupported(String),
 }
 
 /// Errors that can occur in MIDI operations.

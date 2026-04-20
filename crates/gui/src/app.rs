@@ -3,14 +3,16 @@
 use eframe::egui;
 use ondeks_runtime::Host;
 use ondeks_ui_common::{
-    Preferences, Selection, SelectableItem, History,
+    Preferences, Selection, SelectableItem, History, HistoryEntry, UiCommand,
     TransportViewModel, ProjectViewModel, SessionViewModel, MeterViewModel,
+    apply_project_command, apply_without_outcome,
+    commands::ProjectCommand,
 };
-use ondeks_core::NodeId;
+use ondeks_core::{NodeId, TrackId};
 use ondeks_core::project::{Project, TrackType};
 use ondeks_core::session::SlotState;
 use ondeks_core::transport::Transport;
-use crate::views::SessionView;
+use crate::views::{SessionView, TrackMenuAction};
 use crate::widgets::{TransportControls, PositionDisplay, TempoEditor, LevelMeter, PianoKeyboard};
 
 /// The view currently displayed.
@@ -26,13 +28,15 @@ pub struct OndeksApp {
     // Runtime
     host: Host,
 
-    // Project state
+    // Project state — UI-thread source of truth (Slice 4). Migrated to the
+    // engine in Slice 5 when per-track instruments come online.
     project: Project,
 
     // UI state
     current_view: CurrentView,
     selection: Selection,
     history: History,
+    #[allow(dead_code)]
     preferences: Preferences,
 
     // View models (updated each frame)
@@ -46,8 +50,13 @@ pub struct OndeksApp {
     show_inspector: bool,
     show_keyboard: bool,
 
+    /// Inline-rename buffer for the session track header. When Some, the
+    /// session view renders a TextEdit on this track; on commit or cancel the
+    /// app dispatches a `RenameTrack` and clears the buffer.
+    rename_buffer: Option<(TrackId, String)>,
+
     // Built-in synth node in the default graph. UI targets MIDI at this node
-    // until Slice 4 replaces it with per-track instrument lookup.
+    // until Slice 5 replaces it with per-track instrument lookup.
     synth_node_id: NodeId,
 }
 
@@ -58,11 +67,8 @@ impl OndeksApp {
         style.visuals = egui::Visuals::dark();
         cc.egui_ctx.set_style(style);
 
-        // Initialize runtime
         let mut host = Host::new().expect("Failed to create audio host");
-        
-        // Start the audio host
-        // Note: We'll handle errors gracefully in production
+
         match host.start() {
             Ok(()) => {
                 tracing::info!("Audio host started successfully");
@@ -72,17 +78,10 @@ impl OndeksApp {
             }
         }
 
-        // Initialize project with demo tracks for testing
-        let mut project = Project::new("New Project");
-        project.add_track(TrackType::Midi, "Bass");
-        project.add_track(TrackType::Midi, "Lead");
-        project.add_track(TrackType::Audio, "Drums");
-        project.add_track(TrackType::Audio, "Vocals");
-        project.add_scene("Scene 2");
-        project.add_scene("Scene 3");
-        project.add_scene("Scene 4");
+        // Slice 4: project opens empty — just master + Scene 1. User adds
+        // tracks via the "+" button in the session view.
+        let project = Project::new("New Project");
 
-        // Create initial view models
         let transport = Transport::new(44100);
         let transport_vm = TransportViewModel::from_transport(&transport, false);
         let project_vm = ProjectViewModel::from_project(&project);
@@ -108,6 +107,7 @@ impl OndeksApp {
             show_mixer: true,
             show_inspector: true,
             show_keyboard: true,
+            rename_buffer: None,
             synth_node_id,
         }
     }
@@ -137,6 +137,109 @@ impl OndeksApp {
                     self.transport_vm.is_playing = is_playing;
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Rebuild project and session view models from the current project.
+    fn rebuild_view_models(&mut self) {
+        self.project_vm = ProjectViewModel::from_project(&self.project);
+        self.session_vm = SessionViewModel::from_project(
+            &self.project,
+            |_track, _scene| SlotState::Empty,
+            |_track, _scene| false,
+        );
+    }
+
+    /// Apply a user-originated project command, record its inverse in the
+    /// undo history, and rebuild view models. Failed mutations are logged and
+    /// leave state untouched.
+    fn dispatch_project_command(&mut self, cmd: ProjectCommand) {
+        let description = cmd.description().to_string();
+        match apply_project_command(&mut self.project, &cmd) {
+            Ok(outcome) => {
+                self.history.record(HistoryEntry {
+                    description,
+                    undo: UiCommand::Project(outcome.undo),
+                    redo: UiCommand::Project(outcome.redo),
+                });
+                self.rebuild_view_models();
+            }
+            Err(e) => tracing::warn!("project dispatch failed ({description}): {e}"),
+        }
+    }
+
+    /// Replay a UI command during undo/redo without recording a new history
+    /// entry. History already holds the inverse pair.
+    fn apply_ui_command_replay(&mut self, cmd: UiCommand) {
+        match cmd {
+            UiCommand::Project(pc) => {
+                if let Err(e) = apply_without_outcome(&mut self.project, &pc) {
+                    tracing::warn!("undo/redo replay failed: {e}");
+                }
+                self.rebuild_view_models();
+            }
+            _ => {
+                // Other UI command families aren't routed through the project
+                // dispatcher yet; silently ignore for now.
+            }
+        }
+    }
+
+    /// Handle Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z shortcuts.
+    ///
+    /// Walks the event queue explicitly rather than using `consume_shortcut`
+    /// because egui's `Modifiers::matches_logically` treats pattern modifiers
+    /// as a *subset* requirement — a `Ctrl+Z` pattern also matches `Ctrl+Shift+Z`,
+    /// which would swallow the redo event before redo's pattern could see it.
+    /// Matching events by exact modifier equality sidesteps that.
+    fn handle_undo_redo_shortcuts(&mut self, ctx: &egui::Context) {
+        let (do_undo, do_redo) = ctx.input_mut(|i| {
+            let mut do_undo = false;
+            let mut do_redo = false;
+            i.events.retain(|event| {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    let cmd = modifiers.command || modifiers.ctrl;
+                    let shift = modifiers.shift;
+                    let alt = modifiers.alt;
+                    if cmd && !alt {
+                        // Ctrl+Z (no shift) → undo
+                        if !shift && *key == egui::Key::Z {
+                            do_undo = true;
+                            return false;
+                        }
+                        // Ctrl+Shift+Z or Ctrl+Y → redo
+                        if (shift && *key == egui::Key::Z)
+                            || (!shift && *key == egui::Key::Y)
+                        {
+                            do_redo = true;
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+            (do_undo, do_redo)
+        });
+
+        if do_undo {
+            if let Some(cmd) = self.history.undo() {
+                tracing::debug!("undo: {}", cmd.description());
+                self.apply_ui_command_replay(cmd);
+            }
+        }
+        if do_redo {
+            if let Some(cmd) = self.history.redo() {
+                tracing::debug!("redo: {}", cmd.description());
+                self.apply_ui_command_replay(cmd);
+            } else {
+                tracing::debug!("redo shortcut fired but redo stack is empty");
             }
         }
     }
@@ -219,6 +322,31 @@ impl OndeksApp {
             // Time signature
             ui.label(&self.transport_vm.time_sig_string());
 
+            // Undo/redo status indicators
+            ui.separator();
+            ui.add_enabled(
+                self.history.can_undo(),
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "↶ {}",
+                        self.history.undo_description().unwrap_or("")
+                    ))
+                    .small()
+                    .color(egui::Color32::from_gray(140)),
+                ),
+            );
+            ui.add_enabled(
+                self.history.can_redo(),
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "↷ {}",
+                        self.history.redo_description().unwrap_or("")
+                    ))
+                    .small()
+                    .color(egui::Color32::from_gray(140)),
+                ),
+            );
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Right side controls
                 ui.toggle_value(&mut self.show_mixer, "Mixer");
@@ -248,7 +376,19 @@ impl OndeksApp {
 
     /// Render session view (clip launcher grid).
     fn render_session_view(&mut self, ui: &mut egui::Ui) {
+        // If a rename is in progress, hand the buffer to the session view so
+        // it can render the TextEdit inline. This is ergonomic once the
+        // borrow is carved out up front.
+        let rename_state = self
+            .rename_buffer
+            .as_mut()
+            .map(|(id, buf)| (*id, buf));
+
         let view = SessionView::new(&self.session_vm, &self.selection);
+        let view = match rename_state {
+            Some((id, buf)) => view.with_rename(id, buf),
+            None => view,
+        };
         let response = view.show(ui);
 
         // Handle session view interactions
@@ -264,6 +404,78 @@ impl OndeksApp {
         }
         if response.stop_all_clicked {
             tracing::info!("Stop all clips");
+        }
+
+        // --- Track header actions ---
+        if let Some(track_type) = response.add_track_clicked {
+            let default_name = match track_type {
+                TrackType::Midi => "MIDI Track",
+                TrackType::Audio => "Audio Track",
+                TrackType::Group => "Group",
+                TrackType::Return => "Return",
+                TrackType::Master => "Master",
+            };
+            self.dispatch_project_command(ProjectCommand::AddTrack {
+                track_type,
+                name: default_name.to_string(),
+            });
+        }
+
+        if let Some((id, action)) = response.track_menu_action {
+            match action {
+                TrackMenuAction::StartRename => {
+                    let current = self
+                        .project
+                        .get_track(id)
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default();
+                    self.rename_buffer = Some((id, current));
+                }
+                TrackMenuAction::Duplicate => {
+                    self.dispatch_project_command(ProjectCommand::DuplicateTrack { track_id: id });
+                }
+                TrackMenuAction::Delete => {
+                    self.dispatch_project_command(ProjectCommand::RemoveTrack { track_id: id });
+                }
+                TrackMenuAction::MoveUp => {
+                    if let Some(idx) = self.project.track_index(id) {
+                        if idx > 0 {
+                            self.dispatch_project_command(ProjectCommand::MoveTrack {
+                                track_id: id,
+                                new_index: idx - 1,
+                            });
+                        }
+                    }
+                }
+                TrackMenuAction::MoveDown => {
+                    if let Some(idx) = self.project.track_index(id) {
+                        self.dispatch_project_command(ProjectCommand::MoveTrack {
+                            track_id: id,
+                            new_index: idx + 1,
+                        });
+                    }
+                }
+                TrackMenuAction::SetColor(color) => {
+                    self.dispatch_project_command(ProjectCommand::SetTrackColor {
+                        track_id: id,
+                        color,
+                    });
+                }
+            }
+        }
+
+        if let Some((id, new_name)) = response.rename_commit {
+            let trimmed = new_name.trim();
+            if !trimmed.is_empty() {
+                self.dispatch_project_command(ProjectCommand::RenameTrack {
+                    track_id: id,
+                    name: trimmed.to_string(),
+                });
+            }
+            self.rename_buffer = None;
+        }
+        if response.rename_cancel {
+            self.rename_buffer = None;
         }
     }
 
@@ -391,6 +603,9 @@ impl eframe::App for OndeksApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Poll for runtime events
         self.poll_runtime_events();
+
+        // Undo / redo shortcuts
+        self.handle_undo_redo_shortcuts(ctx);
 
         // Request continuous repaints for meters and transport updates
         // Use a reasonable frame rate (60fps) instead of continuous
