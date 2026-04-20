@@ -1,8 +1,7 @@
-//! Runtime host that manages audio processing.
+//! Runtime host: owns the audio backend and drives the engine from the audio callback.
 
-use ondeks_core::{Command, Engine, State};
-use ondeks_core::graph::ProcessContext;
-use ondeks_core::transport::Transport;
+use ondeks_core::{Command, Engine, NodeId};
+use ondeks_core::dsp::StereoBuffer;
 use crate::audio::{AudioBackend, AudioConfig, AudioDeviceInfo, AudioError, CpalBackend};
 use crate::queue::{CommandQueue, CommandSender, EventQueue, EventReceiver, RuntimeCommand, RuntimeEvent};
 use std::sync::{Arc, Mutex};
@@ -12,15 +11,15 @@ use thiserror::Error;
 pub enum HostError {
     #[error("Audio error: {0}")]
     Audio(#[from] AudioError),
-    
+
     #[error("Already running")]
     AlreadyRunning,
-    
+
     #[error("Not running")]
     NotRunning,
 }
 
-/// The main runtime host.
+/// Runtime host. Owns the audio backend; drives `Engine::process()` from the callback.
 pub struct Host {
     backend: Box<dyn AudioBackend>,
     command_queue: CommandQueue,
@@ -31,44 +30,38 @@ pub struct Host {
     state: Arc<Mutex<HostState>>,
 }
 
+/// State owned by the audio thread (wrapped in Mutex for cross-thread init,
+/// but contended only briefly at command-drain boundaries).
 struct HostState {
     engine: Engine,
-    core_state: State,
-    transport: Transport,
-    // Test tone state
-    test_tone_active: bool,
-    test_tone_frequency: f32,
-    test_tone_phase: f32,
-    test_tone_samples_remaining: u64,
-    test_tone_phase_increment: f32,
-    // Position update throttling
+    /// Stereo buffer the engine writes into. Pre-allocated; resized only if
+    /// CPAL delivers an unexpectedly large block.
+    master_buffer: StereoBuffer,
+    /// Throttle counter for position updates (fires every N blocks).
     position_update_counter: u32,
 }
 
 impl Host {
-    /// Create a new host with default configuration.
+    /// Create a new host with default audio configuration.
     pub fn new() -> Result<Self, HostError> {
         Self::with_config(AudioConfig::default())
     }
 
-    /// Create with specific configuration.
+    /// Create a host with the given audio configuration.
     pub fn with_config(config: AudioConfig) -> Result<Self, HostError> {
         let backend = Box::new(CpalBackend::new(config.clone())?);
         let command_queue = CommandQueue::new(256);
         let event_queue = EventQueue::new(256);
-        
+
         let command_sender = command_queue.sender();
         let event_receiver = event_queue.receiver();
 
+        let buffer_size = config.buffer_size as usize;
+        let sample_rate = config.sample_rate;
+
         let state = Arc::new(Mutex::new(HostState {
-            engine: Engine::new(),
-            core_state: State::new(),
-            transport: Transport::new(config.sample_rate),
-            test_tone_active: false,
-            test_tone_frequency: 440.0,
-            test_tone_phase: 0.0,
-            test_tone_samples_remaining: 0,
-            test_tone_phase_increment: 0.0,
+            engine: Engine::new(sample_rate, buffer_size),
+            master_buffer: StereoBuffer::allocate(buffer_size),
             position_update_counter: 0,
         }));
 
@@ -83,7 +76,7 @@ impl Host {
         })
     }
 
-    /// Start audio processing.
+    /// Start audio processing. Spawns the CPAL callback; the callback drives the engine.
     pub fn start(&mut self) -> Result<(), HostError> {
         if self.backend.is_running() {
             return Err(HostError::AlreadyRunning);
@@ -92,120 +85,92 @@ impl Host {
         let state = self.state.clone();
         let command_receiver = self.command_queue.receiver();
         let event_sender = self.event_queue.sender();
-        let sample_rate = self.config.sample_rate;
 
         let callback = move |output: &mut [f32]| {
-            let mut host_state = state.lock().unwrap();
-            
-            // Process commands
+            let mut guard = state.lock().unwrap();
+            // Reborrow through the guard so the borrow checker can split
+            // disjoint field accesses (engine / master_buffer / counter).
+            let host_state: &mut HostState = &mut guard;
+
+            // Drain command queue: apply to engine, emit mirror events for UI.
             for cmd in command_receiver.drain() {
                 match cmd {
                     RuntimeCommand::Core(c) => {
+                        host_state.engine.apply_command(c.clone());
                         match c {
                             Command::Play => {
-                                host_state.transport = host_state.transport.play();
-                                // Notify UI of state change
                                 event_sender.send(RuntimeEvent::TransportStateChanged {
                                     is_playing: true,
                                 });
                             }
                             Command::Stop => {
-                                host_state.transport = host_state.transport.stop();
-                                // Notify UI of state change
                                 event_sender.send(RuntimeEvent::TransportStateChanged {
                                     is_playing: false,
                                 });
                             }
-                            Command::SetTempo(bpm) => {
-                                host_state.transport = host_state.transport.set_tempo(bpm);
-                            }
+                            _ => {}
                         }
                     }
                     RuntimeCommand::Shutdown => return,
                     RuntimeCommand::SetAudioConfig(_) => {
-                        // Configuration changes will be handled in a future phase
+                        // Device reconfiguration handled in a later slice.
                     }
-                    RuntimeCommand::PlayTestTone { frequency, duration } => {
-                        host_state.test_tone_active = true;
-                        host_state.test_tone_frequency = frequency;
-                        host_state.test_tone_phase = 0.0;
-                        host_state.test_tone_samples_remaining = (duration * sample_rate as f32) as u64;
-                        host_state.test_tone_phase_increment = frequency / sample_rate as f32;
+                    RuntimeCommand::PlayTestTone { .. } => {
+                        // Deprecated: the default engine graph already produces a tone
+                        // on Play. Ignored; preserved for wire-compat until Slice 4
+                        // ships a proper CLI 'test tone' path.
                     }
                 }
             }
 
-            // Create process context (will be used when processing the graph)
-            let _context = ProcessContext {
-                buffer_size: output.len() / 2,
-                sample_rate,
-                tempo: host_state.transport.tempo(),
-                position: host_state.transport.position(),
-                is_playing: host_state.transport.is_playing(),
-            };
+            // CPAL delivers interleaved stereo: 2 samples per frame.
+            let frames = output.len() / 2;
 
-            // Process audio graph
-            // For now, output test tone if active, otherwise silence
-            // TODO: Use engine and context to process the graph in future phases
-            let num_samples = output.len() / 2; // Stereo, so divide by 2
-            let samples_to_generate = num_samples.min(host_state.test_tone_samples_remaining as usize);
-            
-            if host_state.test_tone_active && samples_to_generate > 0 {
-                // Generate sine wave
-                for i in 0..samples_to_generate {
-                    let sample_value = (host_state.test_tone_phase * 2.0 * std::f32::consts::PI).sin() * 0.3; // 0.3 amplitude to avoid clipping
-                    
-                    // Write to both left and right channels (interleaved)
-                    output[i * 2] = sample_value;     // Left
-                    output[i * 2 + 1] = sample_value; // Right
-                    
-                    // Advance phase
-                    host_state.test_tone_phase += host_state.test_tone_phase_increment;
-                    if host_state.test_tone_phase >= 1.0 {
-                        host_state.test_tone_phase -= 1.0;
-                    }
-                }
-                
-                // Fill remaining samples with silence
-                for i in samples_to_generate..num_samples {
-                    output[i * 2] = 0.0;
-                    output[i * 2 + 1] = 0.0;
-                }
-                
-                // Update remaining samples
-                host_state.test_tone_samples_remaining = host_state.test_tone_samples_remaining.saturating_sub(samples_to_generate as u64);
-                if host_state.test_tone_samples_remaining == 0 {
-                    host_state.test_tone_active = false;
-                }
-            } else {
-                // Silence
-                for sample in output.iter_mut() {
-                    *sample = 0.0;
-                }
+            // Resize the master buffer if the block size changed (rare).
+            if host_state.master_buffer.len() != frames {
+                host_state.master_buffer = StereoBuffer::allocate(frames);
+                host_state.engine.set_buffer_size(frames);
             }
 
-            // Advance transport
-            host_state.transport = host_state.transport.advance((output.len() / 2) as u64);
+            // Run the engine. Writes into master_buffer.
+            host_state.master_buffer.silence();
+            host_state.engine.process(&mut host_state.master_buffer, frames as u32);
 
-            // Send position updates periodically (every 10 buffers to avoid flooding)
+            // Interleave master_buffer → CPAL output.
+            let left = host_state.master_buffer.left().as_slice();
+            let right = host_state.master_buffer.right().as_slice();
+            for i in 0..frames {
+                output[i * 2] = left[i];
+                output[i * 2 + 1] = right[i];
+            }
+
+            // Position update: throttle to every 2 blocks for smooth UI display.
             host_state.position_update_counter += 1;
-            if host_state.position_update_counter >= 10 {
+            if host_state.position_update_counter >= 2 {
                 host_state.position_update_counter = 0;
-                let position = host_state.transport.position();
+                let transport = host_state.engine.transport();
                 event_sender.send(RuntimeEvent::PositionUpdate {
-                    samples: position.0,
-                    beats: host_state.transport.position_beats().0,
+                    samples: transport.position().0,
+                    beats: transport.position_beats().0,
+                    bbt: transport.position_bbt(),
                 });
             }
 
-            // Calculate meters (peak values for left and right channels)
+            // Meter update: peak of each channel.
             let mut left_peak = 0.0f32;
             let mut right_peak = 0.0f32;
-            for i in 0..num_samples {
-                left_peak = left_peak.max(output[i * 2].abs());
-                right_peak = right_peak.max(output[i * 2 + 1].abs());
+            for &s in left {
+                let a = s.abs();
+                if a > left_peak { left_peak = a; }
             }
-            event_sender.send(RuntimeEvent::MeterUpdate { left: left_peak, right: right_peak });
+            for &s in right {
+                let a = s.abs();
+                if a > right_peak { right_peak = a; }
+            }
+            event_sender.send(RuntimeEvent::MeterUpdate {
+                left: left_peak,
+                right: right_peak,
+            });
         };
 
         self.backend.start(Box::new(callback))?;
@@ -227,13 +192,15 @@ impl Host {
             .map_err(|_| HostError::NotRunning)
     }
 
-    /// Play a test tone.
+    /// Deprecated: use `send_command(Command::Play)` instead — the default graph
+    /// produces a tone when playing. Kept for wire compatibility.
+    #[deprecated(note = "use send_command(Command::Play); default graph produces a tone")]
     pub fn play_test_tone(&self, frequency: f32, duration: f32) -> Result<(), HostError> {
         self.command_sender.send(RuntimeCommand::PlayTestTone { frequency, duration })
             .map_err(|_| HostError::NotRunning)
     }
 
-    /// Poll for events (non-blocking).
+    /// Poll for events from the engine (non-blocking).
     pub fn poll_events(&self) -> impl Iterator<Item = RuntimeEvent> + '_ {
         self.event_receiver.drain()
     }
@@ -243,7 +210,7 @@ impl Host {
         &self.config
     }
 
-    /// Get sample rate.
+    /// Get the current sample rate.
     pub fn sample_rate(&self) -> u32 {
         self.backend.sample_rate()
     }
@@ -253,9 +220,18 @@ impl Host {
         self.backend.list_devices()
     }
 
-    /// Check if running.
+    /// Check if the host is currently running.
     pub fn is_running(&self) -> bool {
         self.backend.is_running()
+    }
+
+    /// Node ID of the built-in synth in the default engine graph.
+    ///
+    /// The UI uses this to target `Command::SendMidi { target, .. }`. Briefly
+    /// takes the state mutex; call during setup, not per-frame. Temporary
+    /// affordance until Slice 4 lands per-track instruments.
+    pub fn synth_node_id(&self) -> NodeId {
+        self.state.lock().unwrap().engine.synth_node_id()
     }
 }
 

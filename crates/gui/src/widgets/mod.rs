@@ -1,7 +1,9 @@
 //! Custom egui widgets for Ondeks.
 
-mod transport;
+mod keyboard;
 mod meter;
+mod transport;
 
-pub use transport::*;
+pub use keyboard::{PianoKeyboard, PianoKeyboardResponse};
 pub use meter::*;
+pub use transport::*;

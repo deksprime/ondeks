@@ -5,6 +5,7 @@ use eframe::egui;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
+mod views;
 mod widgets;
 
 fn main() -> Result<()> {

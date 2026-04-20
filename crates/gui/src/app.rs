@@ -3,12 +3,15 @@
 use eframe::egui;
 use ondeks_runtime::Host;
 use ondeks_ui_common::{
-    Preferences, Selection, History,
-    TransportViewModel, ProjectViewModel, MeterViewModel,
+    Preferences, Selection, SelectableItem, History,
+    TransportViewModel, ProjectViewModel, SessionViewModel, MeterViewModel,
 };
-use ondeks_core::project::Project;
+use ondeks_core::NodeId;
+use ondeks_core::project::{Project, TrackType};
+use ondeks_core::session::SlotState;
 use ondeks_core::transport::Transport;
-use crate::widgets::{TransportControls, PositionDisplay, TempoEditor, LevelMeter};
+use crate::views::SessionView;
+use crate::widgets::{TransportControls, PositionDisplay, TempoEditor, LevelMeter, PianoKeyboard};
 
 /// The view currently displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -35,11 +38,17 @@ pub struct OndeksApp {
     // View models (updated each frame)
     transport_vm: TransportViewModel,
     project_vm: ProjectViewModel,
+    session_vm: SessionViewModel,
     master_meters: MeterViewModel,
 
     // UI state
     show_mixer: bool,
     show_inspector: bool,
+    show_keyboard: bool,
+
+    // Built-in synth node in the default graph. UI targets MIDI at this node
+    // until Slice 4 replaces it with per-track instrument lookup.
+    synth_node_id: NodeId,
 }
 
 impl OndeksApp {
@@ -63,13 +72,27 @@ impl OndeksApp {
             }
         }
 
-        // Initialize project
-        let project = Project::new("New Project");
+        // Initialize project with demo tracks for testing
+        let mut project = Project::new("New Project");
+        project.add_track(TrackType::Midi, "Bass");
+        project.add_track(TrackType::Midi, "Lead");
+        project.add_track(TrackType::Audio, "Drums");
+        project.add_track(TrackType::Audio, "Vocals");
+        project.add_scene("Scene 2");
+        project.add_scene("Scene 3");
+        project.add_scene("Scene 4");
 
         // Create initial view models
         let transport = Transport::new(44100);
         let transport_vm = TransportViewModel::from_transport(&transport, false);
         let project_vm = ProjectViewModel::from_project(&project);
+        let session_vm = SessionViewModel::from_project(
+            &project,
+            |_track, _scene| SlotState::Empty,
+            |_track, _scene| false,
+        );
+
+        let synth_node_id = host.synth_node_id();
 
         Self {
             host,
@@ -80,9 +103,12 @@ impl OndeksApp {
             preferences: Preferences::default(),
             transport_vm,
             project_vm,
+            session_vm,
             master_meters: MeterViewModel::default(),
             show_mixer: true,
             show_inspector: true,
+            show_keyboard: true,
+            synth_node_id,
         }
     }
 
@@ -100,23 +126,11 @@ impl OndeksApp {
                         self.master_meters.update(left, right, 0.95);
                     }
                 }
-                ondeks_runtime::queue::RuntimeEvent::PositionUpdate { beats, samples } => {
-                    // Update transport view model position
+                ondeks_runtime::queue::RuntimeEvent::PositionUpdate { beats, samples, bbt } => {
+                    // Update transport view model position with accurate values from audio thread
                     self.transport_vm.position_beats = beats;
                     self.transport_vm.position_seconds = samples as f64 / 44100.0; // TODO: Use actual sample rate
-                    
-                    // Calculate BBT from beats
-                    let beats_per_bar = self.transport_vm.time_sig_numerator as f64;
-                    let total_beats = beats;
-                    let bar = (total_beats / beats_per_bar).floor() as u32 + 1;
-                    let beat_in_bar = ((total_beats % beats_per_bar).floor() as u32 + 1) as u8;
-                    let tick = ((total_beats % 1.0) * 960.0) as u16; // 960 ticks per beat
-                    
-                    self.transport_vm.position_bbt = ondeks_core::transport::BarBeatTick {
-                        bar,
-                        beat: beat_in_bar,
-                        tick,
-                    };
+                    self.transport_vm.position_bbt = bbt;
                 }
                 ondeks_runtime::queue::RuntimeEvent::TransportStateChanged { is_playing } => {
                     tracing::info!("UI: Transport state changed - is_playing: {}", is_playing);
@@ -208,6 +222,7 @@ impl OndeksApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Right side controls
                 ui.toggle_value(&mut self.show_mixer, "Mixer");
+                ui.toggle_value(&mut self.show_keyboard, "Keyboard");
                 ui.toggle_value(&mut self.show_inspector, "Inspector");
 
                 // Master meters using the LevelMeter widget
@@ -233,31 +248,23 @@ impl OndeksApp {
 
     /// Render session view (clip launcher grid).
     fn render_session_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Session View");
-        ui.label("Clip launcher grid will be implemented in Phase 2.3");
+        let view = SessionView::new(&self.session_vm, &self.selection);
+        let response = view.show(ui);
 
-        // Placeholder grid
-        egui::Grid::new("session_grid")
-            .num_columns(self.project_vm.tracks.len().max(1))
-            .spacing([4.0, 4.0])
-            .show(ui, |ui| {
-                // Track headers
-                for track in &self.project_vm.tracks {
-                    ui.label(&track.name);
-                }
-                ui.end_row();
-
-                // Scene rows
-                for scene in &self.project_vm.scenes {
-                    for _track in &self.project_vm.tracks {
-                        if ui.button("○").clicked() {
-                            // TODO: Launch clip
-                        }
-                    }
-                    ui.label(&scene.name);
-                    ui.end_row();
-                }
-            });
+        // Handle session view interactions
+        if let Some((track, scene)) = response.slot_clicked {
+            self.selection.select(SelectableItem::SessionSlot { track, scene });
+            tracing::info!("Session slot clicked: track={}, scene={}", track, scene);
+        }
+        if let Some(scene) = response.scene_launched {
+            tracing::info!("Scene launched: {}", scene);
+        }
+        if let Some(track) = response.track_stopped {
+            tracing::info!("Track stopped: {}", track);
+        }
+        if response.stop_all_clicked {
+            tracing::info!("Stop all clips");
+        }
     }
 
     /// Render arrangement view (timeline).
@@ -328,6 +335,19 @@ impl OndeksApp {
         }
     }
 
+    /// Render the on-screen piano keyboard. Forwards generated MIDI events
+    /// to the engine via `Command::SendMidi`.
+    fn render_keyboard(&mut self, ui: &mut egui::Ui) {
+        let response = PianoKeyboard::new().height(90.0).show(ui);
+        for event in response.events {
+            let _ = self.host.send_command(ondeks_core::Command::SendMidi {
+                target: self.synth_node_id,
+                event,
+                sample_offset: 0,
+            });
+        }
+    }
+
     /// Render the mixer panel.
     fn render_mixer(&mut self, ui: &mut egui::Ui) {
         ui.heading("Mixer");
@@ -381,7 +401,7 @@ impl eframe::App for OndeksApp {
             self.render_toolbar(ui);
         });
 
-        // Bottom mixer panel (if visible)
+        // Bottom mixer panel (if visible) — docks at the very bottom.
         if self.show_mixer {
             egui::TopBottomPanel::bottom("mixer")
                 .resizable(true)
@@ -389,6 +409,17 @@ impl eframe::App for OndeksApp {
                 .default_height(200.0)
                 .show(ctx, |ui| {
                     self.render_mixer(ui);
+                });
+        }
+
+        // Keyboard panel, stacked above the mixer (egui stacks bottom panels
+        // in show() order — the first is outermost).
+        if self.show_keyboard {
+            egui::TopBottomPanel::bottom("keyboard")
+                .resizable(false)
+                .exact_height(100.0)
+                .show(ctx, |ui| {
+                    self.render_keyboard(ui);
                 });
         }
 
