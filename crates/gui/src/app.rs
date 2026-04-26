@@ -595,43 +595,231 @@ impl OndeksApp {
         }
     }
 
-    /// Render the mixer panel.
+    /// Render the mixer panel: per-track strips + master.
     fn render_mixer(&mut self, ui: &mut egui::Ui) {
         ui.heading("Mixer");
 
+        // Collect actions inside the iteration so we don't double-borrow self
+        // for both view models (read) and dispatchers (write).
+        let mut actions: Vec<(TrackId, StripActionKind)> = Vec::new();
+        let mut master_volume_change: Option<f32> = None;
+
         ui.horizontal(|ui| {
-            for track in &self.project_vm.tracks {
+            // Per-track strips (skip master — rendered separately on the right).
+            for track in self
+                .project_vm
+                .tracks
+                .iter()
+                .filter(|t| t.track_type != TrackType::Master)
+            {
                 ui.vertical(|ui| {
-                    ui.set_width(60.0);
+                    ui.set_width(64.0);
 
-                    // Track name
-                    ui.label(&track.name);
+                    // Color stripe + name.
+                    let (stripe_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(60.0, 4.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(
+                        stripe_rect,
+                        1.0,
+                        egui::Color32::from_rgb(track.color.r, track.color.g, track.color.b),
+                    );
+                    ui.label(
+                        egui::RichText::new(&track.name)
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(220)),
+                    );
 
-                    // Fader (vertical slider)
+                    // Fader (vertical).
                     let mut volume = track.volume_db;
-                    ui.add(egui::Slider::new(&mut volume, -60.0..=6.0).vertical().text("dB"));
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut volume, -60.0..=6.0)
+                                .vertical()
+                                .show_value(false)
+                                .text(""),
+                        )
+                        .changed()
+                    {
+                        actions.push((track.id, StripActionKind::SetVolume(volume)));
+                    }
+                    ui.label(
+                        egui::RichText::new(track.volume_string())
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(180)),
+                    );
 
-                    // Pan knob (placeholder)
-                    ui.label(track.pan_string());
+                    // Pan slider (horizontal, narrow).
+                    let mut pan = track.pan;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut pan, -1.0..=1.0)
+                                .show_value(false)
+                                .text(""),
+                        )
+                        .changed()
+                    {
+                        actions.push((track.id, StripActionKind::SetPan(pan)));
+                    }
+                    ui.label(
+                        egui::RichText::new(track.pan_string())
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(180)),
+                    );
 
-                    // Mute/Solo buttons
+                    // Mute/Solo buttons.
                     ui.horizontal(|ui| {
-                        let m_color = if track.muted { egui::Color32::YELLOW } else { egui::Color32::GRAY };
-                        if ui.add(egui::Button::new("M").fill(m_color).min_size(egui::vec2(20.0, 20.0))).clicked() {
-                            // TODO: Toggle mute
+                        let m_color = if track.muted {
+                            egui::Color32::from_rgb(255, 193, 7)
+                        } else {
+                            egui::Color32::from_gray(70)
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new("M")
+                                    .fill(m_color)
+                                    .min_size(egui::vec2(22.0, 18.0)),
+                            )
+                            .clicked()
+                        {
+                            actions.push((track.id, StripActionKind::ToggleMute));
                         }
 
-                        let s_color = if track.soloed { egui::Color32::from_rgb(76, 175, 80) } else { egui::Color32::GRAY };
-                        if ui.add(egui::Button::new("S").fill(s_color).min_size(egui::vec2(20.0, 20.0))).clicked() {
-                            // TODO: Toggle solo
+                        let s_color = if track.soloed {
+                            egui::Color32::from_rgb(76, 175, 80)
+                        } else {
+                            egui::Color32::from_gray(70)
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new("S")
+                                    .fill(s_color)
+                                    .min_size(egui::vec2(22.0, 18.0)),
+                            )
+                            .clicked()
+                        {
+                            actions.push((track.id, StripActionKind::ToggleSolo));
                         }
                     });
                 });
 
                 ui.separator();
             }
+
+            // Master strip on the right.
+            if let Some(master_vm) = self.project_vm.master_track() {
+                ui.vertical(|ui| {
+                    ui.set_width(72.0);
+                    ui.label(
+                        egui::RichText::new("Master")
+                            .strong()
+                            .color(egui::Color32::from_gray(230)),
+                    );
+                    let mut master_volume = master_vm.volume_db;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut master_volume, -60.0..=6.0)
+                                .vertical()
+                                .show_value(false)
+                                .text(""),
+                        )
+                        .changed()
+                    {
+                        master_volume_change = Some(master_volume);
+                    }
+                    ui.label(
+                        egui::RichText::new(master_vm.volume_string())
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(180)),
+                    );
+                });
+            }
         });
+
+        // Apply actions outside the borrow scope.
+        for (track_id, kind) in actions {
+            self.apply_strip_action(track_id, kind);
+        }
+        if let Some(v) = master_volume_change {
+            self.set_master_volume(v);
+        }
     }
+
+    fn apply_strip_action(&mut self, track_id: TrackId, kind: StripActionKind) {
+        // Read current state once.
+        let Some(track) = self.project.get_track(track_id) else { return };
+        let strip_id = track.channel_strip;
+        let cur_muted = track.muted;
+        let cur_soloed = track.soloed;
+
+        match kind {
+            StripActionKind::SetVolume(v) => {
+                if let Some(t) = self.project.get_track_mut(track_id) {
+                    t.volume_db = v;
+                }
+                if let Some(s) = strip_id {
+                    let _ = self.host.send_command(ondeks_core::Command::SetTrackVolume {
+                        node_id: s,
+                        volume_db: v,
+                    });
+                }
+            }
+            StripActionKind::SetPan(p) => {
+                if let Some(t) = self.project.get_track_mut(track_id) {
+                    t.pan = p;
+                }
+                if let Some(s) = strip_id {
+                    let _ = self.host.send_command(ondeks_core::Command::SetTrackPan {
+                        node_id: s,
+                        pan: p,
+                    });
+                }
+            }
+            StripActionKind::ToggleMute => {
+                let new_muted = !cur_muted;
+                if let Some(t) = self.project.get_track_mut(track_id) {
+                    t.muted = new_muted;
+                }
+                if let Some(s) = strip_id {
+                    let _ = self.host.send_command(ondeks_core::Command::SetTrackMute {
+                        node_id: s,
+                        muted: new_muted,
+                    });
+                }
+            }
+            StripActionKind::ToggleSolo => {
+                let new_soloed = !cur_soloed;
+                if let Some(t) = self.project.get_track_mut(track_id) {
+                    t.soloed = new_soloed;
+                }
+                if let Some(s) = strip_id {
+                    let _ = self.host.send_command(ondeks_core::Command::SetTrackSolo {
+                        node_id: s,
+                        soloed: new_soloed,
+                    });
+                }
+            }
+        }
+        self.rebuild_view_models();
+    }
+
+    fn set_master_volume(&mut self, volume_db: f32) {
+        self.project.master_mut().volume_db = volume_db;
+        let _ = self
+            .host
+            .send_command(ondeks_core::Command::SetMasterVolume { volume_db });
+        self.rebuild_view_models();
+    }
+}
+
+/// Mixer strip action types (declared at module scope so the inner helper can
+/// take them by value without inheriting the closure's borrow scope).
+enum StripActionKind {
+    SetVolume(f32),
+    SetPan(f32),
+    ToggleMute,
+    ToggleSolo,
 }
 
 impl eframe::App for OndeksApp {

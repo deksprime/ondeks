@@ -212,3 +212,54 @@ Each MIDI track now owns its own `SynthNode`. The keyboard widget targets the **
 - **Arm state survives undo of the armed track's deletion.** If you arm track A, delete A, undo → A is back but the `armed` flag is false (since the snapshot captured it pre-arm). Acceptable; users re-arm when they want to play. Could be revisited if annoying.
 - **The Track::instrument field on audio/return/group tracks is always None.** If we later introduce audio track instruments (e.g. for a Simpler sampler on an Audio track? Unlikely but possible), widen this then.
 - **Arm is not yet keyboard-accessible.** You have to click the R button; no shortcut like Alt+Number. Flag for polish.
+
+---
+
+## Slice 6: Working Mixer
+
+- **Status:** Done (pending user verification)
+- **Started:** 2026-04-26
+- **Landed:** 2026-04-26
+- **Effort:** MEDIUM (as estimated)
+
+### Summary
+Volume faders, pan, mute, solo, and master fader actually affect audio. Each MIDI track now flows `SynthNode → ChannelStripNode → MasterStripNode → OutputNode`. Per-track strip exposes smoothed gain (~50 ms) and constant-power pan; mute/solo gate the gain target so transitions don't click. Solo is exclusive in semantics (any soloed strip silences all non-soloed strips); the engine recomputes silencing on every solo change. Master strip is a stereo-in/stereo-out gain stage between all per-track strips and the OutputNode.
+
+### Files touched
+- **New:** `core/src/graph/nodes/channel_strip.rs` — `ChannelStripNode` (1 mono in → 2 mono outs). One-pole smoothing on gain and pan against per-block targets. Mute/solo gate folded into the gain target so it ramps. 5 unit tests including click avoidance.
+- **New:** `core/src/graph/nodes/master_strip.rs` — `MasterStripNode` (2 mono ins → 2 mono outs). Smoothed master gain; uses the graph processor's existing multi-connection summing on its input ports.
+- **Edit:** `core/src/graph/node.rs` — added opt-in `AudioNode::as_any_mut() -> Option<&mut dyn Any>`. Default `None`; `ChannelStripNode` and `MasterStripNode` override to return `Some(self)` so the engine can downcast trait objects when handling mixer commands.
+- **Edit:** `core/src/graph/nodes/mod.rs` — export the new nodes.
+- **Edit:** `core/src/project/track.rs` — `Track::channel_strip: Option<NodeId>` alongside `instrument`. Both ids are pre-allocated for MIDI tracks at construction so undo/redo preserves both node identities.
+- **Rewrite:** `core/src/command.rs` — `Command::AddSynthNode` / `RemoveSynthNode` (Slice 5) renamed to `AddInstrumentChannel { synth_node_id, strip_node_id, track_id }` / `RemoveInstrumentChannel { synth_node_id, strip_node_id }`. Added mixer commands: `SetTrackVolume`, `SetTrackPan`, `SetTrackMute`, `SetTrackSolo`, `SetMasterVolume`.
+- **Rewrite:** `core/src/engine.rs` — `Engine::new` now creates `MasterStripNode → OutputNode`; per-track `add_instrument_channel` builds `Synth → Strip → Master` atomically. Mixer commands route through a `with_strip` helper using the new `as_any_mut` downcast. Solo recomputes `silenced_by_other_solo` on every strip after any solo change (two-pass: collect soloed, then set the flag).
+- **Edit:** `ui-common/src/dispatch.rs` — emits `AddInstrumentChannel` / `RemoveInstrumentChannel` keyed on `Track::{instrument, channel_strip}`. `DuplicateTrack` allocates fresh ids for both. Updated tests to assert on the new variants.
+- **Edit:** `ui-common/src/commands/project.rs` — descriptions unchanged; `ProjectCommand` itself untouched (mixer state lives on `Track` directly, not as `ProjectCommand` variants — kept simple for Slice 6, may revisit if mixer changes need to participate in undo).
+- **Rewrite:** `gui/src/app.rs::render_mixer` — per-track strips with vertical fader, horizontal pan slider, M/S buttons, dB/pan labels. Master strip rendered on the right. All controls dispatch real engine commands and mutate project state alongside (no undo for mixer changes in Slice 6 — coalescing drag history is polish).
+- **Rewrite:** `core/tests/slice5_per_track_instrument.rs` — uses `AddInstrumentChannel` and `RemoveInstrumentChannel`; `default_engine_has_master_strip_and_output` asserts the new 2-node baseline (master strip + output).
+- **Rewrite:** `core/tests/slice1_audio_flows.rs`, `core/tests/slice3_synth_note.rs` — new helper `new_engine_with_synth()` constructs the engine and dispatches `AddInstrumentChannel`.
+- **New:** `core/tests/slice6_mixer.rs` — 5 integration tests: fader attenuates a track, mute silences a track, solo silences other tracks, pan-full-left silences right channel, master fader attenuates everything. Each asserts on tail-of-buffer (not peak) so the smoothing ramp doesn't dominate.
+
+### Invariants added / reinforced
+- **Click-free parameter changes** — gain and pan are smoothed via a one-pole low-pass against per-block targets with a ~50 ms time constant. Step changes (mute, solo gating) fold into the gain target, so they ramp.
+- **Solo is exclusive in semantics, not in storage** — multiple strips can have `soloed = true`, but the engine treats that as "any of these are soloed → silence the rest". Two-pass recomputation runs on every `SetTrackSolo` command.
+- **Strip and instrument node ids on Track are stable across undo/redo** — `Track::instrument` AND `Track::channel_strip` are pre-allocated at construction. The dispatcher's `RestoreTrack` snapshot carries both, so undo→redo cycles produce a graph that's byte-identical to the pre-undo state.
+- **`AudioNode::as_any_mut` is opt-in** — default returns `None`, so existing nodes that don't need to be poked outside the trait interface pay zero cost. Only `ChannelStripNode` and `MasterStripNode` opt in.
+
+### Test results
+- **349 tests pass**, zero failures (up from 337).
+- 5 new strip unit tests + 5 new Slice 6 integration tests + 2 master strip tests + updates to Slice 1/3/5 tests.
+
+### Surprises / lessons
+- **`Buffer::peak()` over a smoothing ramp is misleading.** First draft of the smoothing tests asserted `peak < target` over a buffer that contained the full ramp — peak was the start of the ramp, which is high. Switched all settle tests to look at the tail (last 256 samples) instead. Lesson: when testing smoothed parameter changes, assert on what you're settling *to*, not the peak across the transition.
+- **`AudioNode` trait objects can't auto-downcast through `Any`.** Adding a non-default `as_any_mut(&mut self) -> Option<&mut dyn Any>` method to the trait is the canonical safe-Rust opt-in. Default `None` means existing nodes don't change; mixer nodes return `Some(self)`. Tried fancier tricks (raw `Any` cast, deferred dispatch tables) — opt-in default is by far the cleanest.
+- **Borrow-splitting `&mut [&mut Buffer]`.** To touch both L and R output buffers in the same iteration, the cleanest pattern is `match &mut *outputs.audio { [l, r, ..] => (&mut **l, &mut **r), _ => return }`. Slice destructure + reborrow. Tried `split_at_mut`, `audio_mut(0)` + `audio_mut(1)` — both fight the borrow checker.
+- **Slice 6 broke 11 existing tests** — every Slice 1/3/5 test that referenced `AddSynthNode`/`RemoveSynthNode` had to be updated, plus the engine-default-graph baseline changed from 1 node (output) to 2 (output + master strip). Worth flagging that every change to default graph topology cascades; the dispatcher's `engine_commands_for_track` is the choke point that absorbs most of it.
+- **Master fader without an undo entry feels right** — egui's slider fires `.changed()` on every drag tick, and a per-tick history entry is awful UX. Mixer mutations skip history entirely in Slice 6. Drag-coalesced undo for faders is a polish slice.
+
+### Follow-ups
+- **Slice 7 (Save/Load)** is next. The full project state (tracks, clips, mixer values) must round-trip through JSON. P0.3 versioning framework operational. Slice 7 will need to walk the project on load and dispatch `AddInstrumentChannel` for each MIDI track to rebuild the graph.
+- **Mixer changes don't go through undo.** Acceptable for MVP, but a polish slice should add drag-coalesced history entries (one per gesture between mouse-down and mouse-up).
+- **Per-track meters** — strip nodes don't yet emit their own meter readings. The runtime master meter still works via `Host`'s post-output peak, but per-strip metering is a separate slice.
+- **No master mute or solo** — master strip only has a gain. Adding a mute on the master is trivial if needed.
+- **Pan law is constant-power.** For mono → stereo this is canonical; if Slice 11+ introduces stereo-input audio tracks, we'll need a "balance" pan (cuts opposite channel) vs. "true pan" (Haas-style) decision.

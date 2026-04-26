@@ -121,6 +121,16 @@ pub trait AudioNode: Send {
     /// Implementations must not allocate, lock, or block. Enqueueing into a
     /// pre-sized buffer and silently dropping on overflow is the expected shape.
     fn handle_midi(&mut self, _event: &MidiEvent, _sample_offset: u32) {}
+
+    /// Opt-in `Any` accessor used by the engine to downcast trait objects to
+    /// their concrete types (e.g. `ChannelStripNode` for mixer commands).
+    ///
+    /// Default returns `None` — node types that don't need to be poked at by
+    /// the engine outside the `AudioNode` interface don't pay any cost. Nodes
+    /// that *do* need it just write `Some(self)`.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 /// Describes a parameter exposed by a node.

@@ -25,25 +25,64 @@ pub enum Command {
         /// Sample offset within the current block (0 = block start).
         sample_offset: u32,
     },
-    /// Insert a polyphonic `SynthNode` into the graph using the given id,
-    /// wire its mono output to both master input ports.
+
+    /// Insert a `SynthNode` + `ChannelStripNode` pair into the graph and wire
+    /// `Synth → Strip → MasterStrip` (the master strip already exists).
     ///
-    /// `track_id` is informational for logging/debugging — the engine keys by
-    /// `node_id`. Callers (typically the UI dispatcher) pre-allocate the id
-    /// on the project's `Track::instrument` so node identity is stable across
-    /// undo/redo cycles.
-    AddSynthNode {
-        /// Id assigned to the new synth node. Must not already exist.
-        node_id: NodeId,
-        /// Track this synth belongs to (for logging/debug; engine ignores).
+    /// Both ids are pre-allocated by the UI dispatcher and stored on the
+    /// owning `Track::instrument` / `Track::channel_strip` so node identity
+    /// is stable across undo/redo cycles.
+    AddInstrumentChannel {
+        /// Node id assigned to the synth.
+        synth_node_id: NodeId,
+        /// Node id assigned to the strip.
+        strip_node_id: NodeId,
+        /// Track this channel belongs to (informational; engine keys by node id).
         track_id: TrackId,
     },
-    /// Disconnect and remove a synth node from the graph.
+    /// Disconnect and remove a synth + its channel strip.
     ///
-    /// No-op if the node does not exist (undo-of-remove is allowed to arrive
-    /// out of order during rapid-undo sequences).
-    RemoveSynthNode {
-        /// Id of the node to remove.
+    /// No-op if either node is absent.
+    RemoveInstrumentChannel {
+        /// Node id of the synth.
+        synth_node_id: NodeId,
+        /// Node id of the strip.
+        strip_node_id: NodeId,
+    },
+
+    /// Set a track's channel-strip volume in decibels. Smoothed on the
+    /// audio side over ~50 ms.
+    SetTrackVolume {
+        /// Strip node id (the dispatcher reads this from `Track::channel_strip`).
         node_id: NodeId,
+        /// New target volume in dB.
+        volume_db: f32,
+    },
+    /// Set a track's pan. -1.0 = full left, 0.0 = center, 1.0 = full right.
+    SetTrackPan {
+        /// Strip node id.
+        node_id: NodeId,
+        /// New target pan, clamped to [-1, 1].
+        pan: f32,
+    },
+    /// Toggle/set mute on a strip.
+    SetTrackMute {
+        /// Strip node id.
+        node_id: NodeId,
+        /// New mute state.
+        muted: bool,
+    },
+    /// Toggle/set solo on a strip. Engine recomputes the
+    /// `silenced_by_other_solo` flag on every other strip.
+    SetTrackSolo {
+        /// Strip node id.
+        node_id: NodeId,
+        /// New solo state.
+        soloed: bool,
+    },
+    /// Set the master output volume in decibels.
+    SetMasterVolume {
+        /// New target master volume in dB.
+        volume_db: f32,
     },
 }

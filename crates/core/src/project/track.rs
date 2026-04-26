@@ -51,6 +51,13 @@ pub struct Track {
     /// master tracks.
     pub instrument: Option<NodeId>,
 
+    /// Graph node id of this track's channel strip (mixer node).
+    ///
+    /// Currently set for MIDI tracks alongside their instrument. Audio /
+    /// group / return / master tracks don't have a per-track strip yet
+    /// (they'll get one when their audio paths land in later slices).
+    pub channel_strip: Option<NodeId>,
+
     // Arrangement clips
     pub arrangement_clips: Vec<ArrangementClip>,
 
@@ -66,11 +73,11 @@ pub struct Track {
 
 impl Track {
     pub fn new(track_type: TrackType, name: impl Into<String>) -> Self {
-        // Allocate a fresh instrument node id up front for MIDI tracks so the
-        // graph node and the track share identity.
-        let instrument = match track_type {
-            TrackType::Midi => Some(NodeId::generate()),
-            _ => None,
+        // Allocate fresh node ids up front for MIDI tracks so the graph
+        // nodes and the project share identity through undo/redo.
+        let (instrument, channel_strip) = match track_type {
+            TrackType::Midi => (Some(NodeId::generate()), Some(NodeId::generate())),
+            _ => (None, None),
         };
         Self {
             id: TrackId::generate(),
@@ -83,6 +90,7 @@ impl Track {
             soloed: false,
             armed: false,
             instrument,
+            channel_strip,
             arrangement_clips: Vec::new(),
             session_slots: Vec::new(),
             sends: HashMap::new(),

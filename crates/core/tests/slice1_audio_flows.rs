@@ -16,10 +16,14 @@ const BLOCK: usize = 512;
 
 fn new_engine_with_synth() -> (Engine, NodeId) {
     let mut engine = Engine::new(SR, BLOCK);
-    let node_id = NodeId::generate();
-    let track_id = TrackId::generate();
-    engine.apply_command(Command::AddSynthNode { node_id, track_id });
-    (engine, node_id)
+    let synth_node_id = NodeId::generate();
+    let strip_node_id = NodeId::generate();
+    engine.apply_command(Command::AddInstrumentChannel {
+        synth_node_id,
+        strip_node_id,
+        track_id: TrackId::generate(),
+    });
+    (engine, synth_node_id)
 }
 
 fn note_on(n: u8) -> MidiEvent {

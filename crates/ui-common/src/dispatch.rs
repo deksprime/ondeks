@@ -155,10 +155,11 @@ pub fn apply_project_command(
                 .ok_or(ProjectError::TrackNotFound(*track_id))?;
             let mut clone = source.clone();
             clone.id = ondeks_core::TrackId::generate();
-            // Fresh instrument id for MIDI tracks — the duplicate gets its
-            // own graph node.
+            // Fresh node ids for MIDI tracks — the duplicate gets its own
+            // instrument + strip pair.
             if clone.track_type == TrackType::Midi {
                 clone.instrument = Some(ondeks_core::NodeId::generate());
+                clone.channel_strip = Some(ondeks_core::NodeId::generate());
             }
             clone.name = format!("{} copy", clone.name);
             let source_index = project.track_index(*track_id).unwrap();
@@ -220,19 +221,24 @@ pub fn apply_without_outcome(
 
 /// Produce engine commands appropriate for a track that is being added
 /// (`adding = true`) or removed (`adding = false`). MIDI tracks with a
-/// pre-assigned `instrument` node id drive `AddSynthNode` / `RemoveSynthNode`;
-/// other track types have no graph representation yet.
+/// pre-assigned `instrument` + `channel_strip` pair drive
+/// `AddInstrumentChannel` / `RemoveInstrumentChannel`; other track types
+/// have no graph representation yet.
 fn engine_commands_for_track(track: &Track, adding: bool) -> Vec<EngineCommand> {
-    let Some(node_id) = track.instrument else {
+    let (Some(synth_id), Some(strip_id)) = (track.instrument, track.channel_strip) else {
         return Vec::new();
     };
     if adding {
-        vec![EngineCommand::AddSynthNode {
-            node_id,
+        vec![EngineCommand::AddInstrumentChannel {
+            synth_node_id: synth_id,
+            strip_node_id: strip_id,
             track_id: track.id,
         }]
     } else {
-        vec![EngineCommand::RemoveSynthNode { node_id }]
+        vec![EngineCommand::RemoveInstrumentChannel {
+            synth_node_id: synth_id,
+            strip_node_id: strip_id,
+        }]
     }
 }
 
@@ -284,15 +290,19 @@ mod tests {
     }
 
     #[test]
-    fn add_midi_track_emits_add_synth_node_engine_command() {
+    fn add_midi_track_emits_add_instrument_channel() {
         let mut p = Project::new("t");
         let outcome = add(&mut p, "Bass");
-        let node_id = p.tracks()[0].instrument.expect("midi track has instrument");
+        let synth_id = p.tracks()[0].instrument.expect("midi track has instrument");
+        let strip_id = p.tracks()[0].channel_strip.expect("midi track has strip");
 
         assert_eq!(outcome.engine_commands.len(), 1);
         match &outcome.engine_commands[0] {
-            EngineCommand::AddSynthNode { node_id: n, .. } => assert_eq!(*n, node_id),
-            c => panic!("expected AddSynthNode, got {c:?}"),
+            EngineCommand::AddInstrumentChannel { synth_node_id, strip_node_id, .. } => {
+                assert_eq!(*synth_node_id, synth_id);
+                assert_eq!(*strip_node_id, strip_id);
+            }
+            c => panic!("expected AddInstrumentChannel, got {c:?}"),
         }
     }
 
@@ -309,10 +319,11 @@ mod tests {
         .unwrap();
         assert!(outcome.engine_commands.is_empty());
         assert!(p.tracks()[0].instrument.is_none());
+        assert!(p.tracks()[0].channel_strip.is_none());
     }
 
     #[test]
-    fn remove_midi_track_emits_remove_synth_node_engine_command() {
+    fn remove_midi_track_emits_remove_instrument_channel() {
         let mut p = Project::new("t");
         let add_out = add(&mut p, "Bass");
         let id = if let ProjectCommand::RemoveTrack { track_id } = add_out.undo {
@@ -320,7 +331,8 @@ mod tests {
         } else {
             unreachable!();
         };
-        let node_id = p.get_track(id).unwrap().instrument.unwrap();
+        let synth_id = p.get_track(id).unwrap().instrument.unwrap();
+        let strip_id = p.get_track(id).unwrap().channel_strip.unwrap();
 
         let rm = apply_project_command(
             &mut p,
@@ -329,28 +341,35 @@ mod tests {
         .unwrap();
         assert_eq!(rm.engine_commands.len(), 1);
         match &rm.engine_commands[0] {
-            EngineCommand::RemoveSynthNode { node_id: n } => assert_eq!(*n, node_id),
-            c => panic!("expected RemoveSynthNode, got {c:?}"),
+            EngineCommand::RemoveInstrumentChannel { synth_node_id, strip_node_id } => {
+                assert_eq!(*synth_node_id, synth_id);
+                assert_eq!(*strip_node_id, strip_id);
+            }
+            c => panic!("expected RemoveInstrumentChannel, got {c:?}"),
         }
     }
 
     #[test]
-    fn restore_after_remove_reuses_same_node_id() {
+    fn restore_after_remove_reuses_same_node_ids() {
         let mut p = Project::new("t");
         let _ = add(&mut p, "Bass");
         let id = p.tracks()[0].id;
-        let node_id = p.tracks()[0].instrument.unwrap();
+        let synth_id = p.tracks()[0].instrument.unwrap();
+        let strip_id = p.tracks()[0].channel_strip.unwrap();
 
         let rm = apply_project_command(&mut p, &ProjectCommand::RemoveTrack { track_id: id }).unwrap();
         let restore_out = apply_project_command(&mut p, &rm.undo).unwrap();
 
-        // Restore must re-emit AddSynthNode with the original node id.
         assert_eq!(restore_out.engine_commands.len(), 1);
         match &restore_out.engine_commands[0] {
-            EngineCommand::AddSynthNode { node_id: n, .. } => assert_eq!(*n, node_id),
-            c => panic!("expected AddSynthNode, got {c:?}"),
+            EngineCommand::AddInstrumentChannel { synth_node_id, strip_node_id, .. } => {
+                assert_eq!(*synth_node_id, synth_id);
+                assert_eq!(*strip_node_id, strip_id);
+            }
+            c => panic!("expected AddInstrumentChannel, got {c:?}"),
         }
-        assert_eq!(p.tracks()[0].instrument, Some(node_id));
+        assert_eq!(p.tracks()[0].instrument, Some(synth_id));
+        assert_eq!(p.tracks()[0].channel_strip, Some(strip_id));
     }
 
     #[test]
@@ -454,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_creates_new_id_and_fresh_instrument() {
+    fn duplicate_creates_new_ids_and_fresh_node_pair() {
         let mut p = Project::new("t");
         let a = add(&mut p, "A");
         let id = if let ProjectCommand::RemoveTrack { track_id } = a.undo {
@@ -463,10 +482,11 @@ mod tests {
             unreachable!()
         };
         let original_instrument = p.get_track(id).unwrap().instrument;
+        let original_strip = p.get_track(id).unwrap().channel_strip;
 
         let dup = apply_project_command(&mut p, &ProjectCommand::DuplicateTrack { track_id: id })
             .unwrap();
-        assert_eq!(p.tracks().len(), 3); // original + duplicate + master
+        assert_eq!(p.tracks().len(), 3);
         let new_id = if let ProjectCommand::RemoveTrack { track_id } = dup.undo {
             track_id
         } else {
@@ -476,10 +496,9 @@ mod tests {
         assert_eq!(p.get_track(new_id).unwrap().name, "A copy");
 
         let new_instrument = p.get_track(new_id).unwrap().instrument;
-        assert_ne!(
-            new_instrument, original_instrument,
-            "duplicate must get a fresh instrument node id"
-        );
+        let new_strip = p.get_track(new_id).unwrap().channel_strip;
+        assert_ne!(new_instrument, original_instrument);
+        assert_ne!(new_strip, original_strip);
 
         apply_project_command(&mut p, &dup.undo).unwrap();
         assert!(p.get_track(new_id).is_none());
