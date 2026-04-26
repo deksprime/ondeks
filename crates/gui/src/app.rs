@@ -5,10 +5,10 @@ use ondeks_runtime::Host;
 use ondeks_ui_common::{
     Preferences, Selection, SelectableItem, History, HistoryEntry, UiCommand,
     TransportViewModel, ProjectViewModel, SessionViewModel, MeterViewModel,
-    apply_project_command, apply_without_outcome,
+    apply_project_command,
     commands::ProjectCommand,
 };
-use ondeks_core::{NodeId, TrackId};
+use ondeks_core::TrackId;
 use ondeks_core::project::{Project, TrackType};
 use ondeks_core::session::SlotState;
 use ondeks_core::transport::Transport;
@@ -54,10 +54,6 @@ pub struct OndeksApp {
     /// session view renders a TextEdit on this track; on commit or cancel the
     /// app dispatches a `RenameTrack` and clears the buffer.
     rename_buffer: Option<(TrackId, String)>,
-
-    // Built-in synth node in the default graph. UI targets MIDI at this node
-    // until Slice 5 replaces it with per-track instrument lookup.
-    synth_node_id: NodeId,
 }
 
 impl OndeksApp {
@@ -91,8 +87,6 @@ impl OndeksApp {
             |_track, _scene| false,
         );
 
-        let synth_node_id = host.synth_node_id();
-
         Self {
             host,
             project,
@@ -108,7 +102,6 @@ impl OndeksApp {
             show_inspector: true,
             show_keyboard: true,
             rename_buffer: None,
-            synth_node_id,
         }
     }
 
@@ -152,30 +145,44 @@ impl OndeksApp {
     }
 
     /// Apply a user-originated project command, record its inverse in the
-    /// undo history, and rebuild view models. Failed mutations are logged and
+    /// undo history, forward any engine commands to the audio thread, and
+    /// rebuild view models. Arm commands are applied without history since
+    /// arm is an ephemeral routing flag. Failed mutations are logged and
     /// leave state untouched.
     fn dispatch_project_command(&mut self, cmd: ProjectCommand) {
         let description = cmd.description().to_string();
+        let is_undoable = !matches!(cmd, ProjectCommand::ArmTrack { .. });
         match apply_project_command(&mut self.project, &cmd) {
             Ok(outcome) => {
-                self.history.record(HistoryEntry {
-                    description,
-                    undo: UiCommand::Project(outcome.undo),
-                    redo: UiCommand::Project(outcome.redo),
-                });
+                for engine_cmd in &outcome.engine_commands {
+                    let _ = self.host.send_command(engine_cmd.clone());
+                }
+                if is_undoable {
+                    self.history.record(HistoryEntry {
+                        description,
+                        undo: UiCommand::Project(outcome.undo),
+                        redo: UiCommand::Project(outcome.redo),
+                    });
+                }
                 self.rebuild_view_models();
             }
             Err(e) => tracing::warn!("project dispatch failed ({description}): {e}"),
         }
     }
 
-    /// Replay a UI command during undo/redo without recording a new history
-    /// entry. History already holds the inverse pair.
+    /// Replay a UI command during undo/redo — mutate the project and forward
+    /// any engine commands that mirror the mutation. History has the inverse
+    /// pair already, so we don't push a new entry.
     fn apply_ui_command_replay(&mut self, cmd: UiCommand) {
         match cmd {
             UiCommand::Project(pc) => {
-                if let Err(e) = apply_without_outcome(&mut self.project, &pc) {
-                    tracing::warn!("undo/redo replay failed: {e}");
+                match apply_project_command(&mut self.project, &pc) {
+                    Ok(outcome) => {
+                        for engine_cmd in &outcome.engine_commands {
+                            let _ = self.host.send_command(engine_cmd.clone());
+                        }
+                    }
+                    Err(e) => tracing::warn!("undo/redo replay failed: {e}"),
                 }
                 self.rebuild_view_models();
             }
@@ -477,6 +484,21 @@ impl OndeksApp {
         if response.rename_cancel {
             self.rename_buffer = None;
         }
+
+        if let Some(track_id) = response.arm_track {
+            // Toggle: if this track is already armed, clicking disarms it.
+            let already_armed = self
+                .project
+                .get_track(track_id)
+                .map(|t| t.armed)
+                .unwrap_or(false);
+            if already_armed {
+                self.project.disarm_all();
+                self.rebuild_view_models();
+            } else {
+                self.dispatch_project_command(ProjectCommand::ArmTrack { track_id });
+            }
+        }
     }
 
     /// Render arrangement view (timeline).
@@ -547,13 +569,26 @@ impl OndeksApp {
         }
     }
 
-    /// Render the on-screen piano keyboard. Forwards generated MIDI events
-    /// to the engine via `Command::SendMidi`.
+    /// Render the on-screen piano keyboard. Forwards MIDI events to the
+    /// armed MIDI track's instrument. Dropped silently if no track is armed
+    /// or the armed track has no instrument.
     fn render_keyboard(&mut self, ui: &mut egui::Ui) {
         let response = PianoKeyboard::new().height(90.0).show(ui);
+        if response.events.is_empty() {
+            return;
+        }
+        let target = self
+            .project
+            .armed_track()
+            .and_then(|t| t.instrument);
+        let Some(target) = target else {
+            // No armed MIDI track → keyboard input is silent. Tracing only,
+            // no user-visible warning (common during startup / between arms).
+            return;
+        };
         for event in response.events {
             let _ = self.host.send_command(ondeks_core::Command::SendMidi {
-                target: self.synth_node_id,
+                target,
                 event,
                 sample_offset: 0,
             });

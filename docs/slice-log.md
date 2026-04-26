@@ -158,3 +158,57 @@ The plan (4.T2) prescribed moving `Project` into the engine so the audio thread 
 - **Save/Load** still missing (Slice 7). Right now if the app crashes mid-session all work is lost; worth flagging to user when they start a real session.
 - **Color palette is fixed at 8 presets.** A proper color picker (HSV wheel or RGB sliders) is a polish slice; for now 8 is enough to distinguish tracks visually.
 - **Undo/redo description labels in toolbar are faint gray** — the labels show whatever command description last ran. Useful for debugging, possibly noisy for regular users; hide behind a preference later.
+
+### Post-landing fix (same day)
+- **Ctrl+Shift+Z / Ctrl+Y silently swallowed by the undo shortcut.** egui's `Modifiers::matches_logically` treats the pattern's modifier flags as a *subset* requirement rather than an exact match — so the undo pattern `Ctrl+Z` (no shift) matched `Ctrl+Shift+Z` events, extra Shift was ignored, `consume_shortcut(&undo)` ate the event before redo's pattern could see it. Fix: replace `consume_shortcut` with an explicit `i.events.retain(...)` scan that checks modifier equality exactly. Added tracing::debug!() on both undo and redo replay paths so future diagnoses are easier.
+
+---
+
+## Slice 5: Synth Instrument Per MIDI Track
+
+- **Status:** Done (pending user verification)
+- **Started:** 2026-04-20
+- **Landed:** 2026-04-20
+- **Effort:** MEDIUM (as estimated)
+
+### Summary
+Each MIDI track now owns its own `SynthNode`. The keyboard widget targets the **armed** track's instrument — arm a track via the new "R" button in the session header, play the keyboard, only that track's synth sounds. Adding a MIDI track automatically creates its synth node with a pre-assigned `NodeId` that matches the `Track::instrument` field; removing a track removes its node; undo/redo round-trips the same node id so the graph is byte-identical across history cycles. The Slice 3 default-demo-graph shim (`Engine::synth_node_id` / `Host::synth_node_id`) is gone — `Engine::new()` now produces an empty graph (master only).
+
+### Files touched
+- **Edit:** `core/src/project/track.rs` — `Track::instrument: Option<NodeId>` field, populated with a fresh id for MIDI tracks at construction. Ensures graph node identity and `Track::instrument` are the same id.
+- **Edit:** `core/src/project/project.rs` — `arm_exclusive(id) -> Option<TrackId>` (returns previously-armed id), `disarm_all()`, `armed_track() -> Option<&Track>`.
+- **Edit:** `core/src/command.rs` — new `Command::AddSynthNode { node_id, track_id }` and `Command::RemoveSynthNode { node_id }` variants.
+- **Edit:** `core/src/graph/nodes/synth.rs` — `SynthNode::with_id(id, sample_rate)` constructor; `SynthNode::new` now delegates to it with a fresh id. Lets the dispatcher pre-assign node ids that match the Track's instrument field.
+- **Rewrite:** `core/src/engine.rs` — `Engine::new()` builds an **empty** graph (master only — no default demo synth). Removed `Engine::synth_node_id()`. Added internal `add_synth_node(id)` / `remove_synth_node(id)` helpers that `apply_command` dispatches to.
+- **Edit:** `runtime/src/host.rs` — removed `Host::synth_node_id()` and the `NodeId` import.
+- **Edit:** `ui-common/src/commands/project.rs` — added `ProjectCommand::ArmTrack { track_id }` (explicitly **non-undoable**; echoes back as both undo and redo so if something does push it into history it stays idempotent).
+- **Rewrite:** `ui-common/src/dispatch.rs` — `ApplyOutcome` grows `engine_commands: Vec<EngineCommand>`. `engine_commands_for_track()` emits `AddSynthNode` / `RemoveSynthNode` keyed on `Track::instrument` (skipped for non-MIDI tracks). DuplicateTrack generates a *fresh* instrument id for the duplicate so each duplicate gets its own graph node. ArmTrack branch is non-mutating-to-undo (echoed as self). Added/updated dispatcher tests covering engine-command emission.
+- **Edit:** `gui/src/views/session.rs` — added 14×14 "R" arm button sub-rect in the upper-right of each MIDI track's header. Red when armed, gray otherwise. Emits `SessionViewResponse::arm_track`. Non-MIDI tracks don't render the button (they can't receive MIDI).
+- **Edit:** `gui/src/app.rs` — `dispatch_project_command` now forwards every `ApplyOutcome::engine_commands` entry to the Host. `apply_ui_command_replay` does the same so undo/redo keeps the graph in sync. Removed the `synth_node_id` field and init. `render_keyboard` routes `Command::SendMidi` to `project.armed_track().instrument`, silent when no track is armed. Arm toggling: clicking the R button on an armed track disarms (non-undoable); clicking an unarmed track dispatches `ArmTrack` (exclusive).
+- **Rewrite:** `core/tests/slice1_audio_flows.rs`, `core/tests/slice3_synth_note.rs` — both now construct an engine then add a synth via `Command::AddSynthNode` before sending MIDI (`new_engine_with_synth()` helper). Added `empty_graph_is_silent` test for Slice 1 to pin the new default.
+- **New:** `core/tests/slice5_per_track_instrument.rs` — 6 tests: default engine has an empty graph, add-synth produces audio, remove-synth silences, two synths are independent (sum louder), duplicate-id add is a noop, remove of unknown node is a noop.
+
+### Invariants added / reinforced
+- **Tracks own their instrument** — `Track::instrument` is the single source of truth for which graph node represents a MIDI track. `NodeId` generation happens at Track construction; the dispatcher reuses that id via `AddSynthNode` so graph and project agree bit-identically.
+- **Engine graph is derived state** — the engine holds no default graph beyond master output; everything is added via `Command::AddSynthNode` in response to UI actions. Slice 7 (Save/Load) will walk tracks and re-emit AddSynthNode on project load.
+- **Arm is exclusive and ephemeral** — only one track armed at a time; arm state is *not* undoable (matches transport Play/Stop invariant).
+- **Undo/redo preserves graph identity** — the same `NodeId` lives through remove→restore cycles because `RestoreTrack` carries the full Track snapshot including its `instrument` field. The dispatcher re-emits `AddSynthNode` with that preserved id.
+
+### Test results
+- **337 tests pass**, zero failures (up from 325).
+- 12 new tests: 6 slice5_per_track_instrument + 3 new dispatcher tests for engine-command emission + 3 updated Slice 1/3 tests (empty graph silence, add-synth-with-helper pattern).
+- Slice 1 and Slice 3 tests now go through the full `AddSynthNode → SendMidi` dispatch path, which exercises more of the engine than the previous "implicit default graph" setup.
+
+### Surprises / lessons
+- **`Track::instrument` at construction, not at dispatch.** Initially I had the dispatcher generate the `NodeId` when `AddTrack` ran. But `Track::new` is called from other places (tests, CLI, eventually Load). Making the Track self-sufficient (owns its id) keeps invariants local — any new Track that should have an instrument gets one for free.
+- **Redo of duplicate needs a *separate* instrument id snapshot.** For `DuplicateTrack`, the duplicate is a fresh Track with a fresh `NodeId`. The redo (`RestoreTrack { snapshot }`) must snapshot *that* duplicate, not the source — otherwise undo→redo would create different graph nodes. Caught it with a test that's now in `dispatch.rs`.
+- **Engine methods need to be no-ops on duplicate/missing ids.** `AddSynthNode` may arrive twice if a user redoes rapidly; `RemoveSynthNode` may arrive for an already-gone node. Both log-and-continue rather than panic keeps the audio thread alive during racy command sequences.
+- **Session view's arm button hit-test sits in front of the header rect's interact.** Allocating the header's response with `Sense::click_and_drag` claims the whole rect; the arm sub-rect uses `ui.interact(sub_rect, id, Sense::click())` which egui lets us layer. The layering relies on the arm rect being rendered *after* the header paint, so paint order matters.
+- **Silently dropping keyboard MIDI when no track is armed** is the right call (matches Ableton). An earlier draft would have warned via tracing, but it fires every frame the user tries to noodle without arming → noisy log. Dropped silently instead; the UI's missing-audio cue is already "no sound."
+
+### Follow-ups
+- **Slice 6 (working mixer)** is next: volume faders / pan / mute / solo actually affect audio. Mixer will want a `ChannelStripNode` inserted between each instrument and master. At that point `AddSynthNode` might evolve to `AddInstrumentChannel` that wires `SynthNode → ChannelStripNode → Master` atomically.
+- **Non-MIDI track types still have no audio representation.** Audio, Group, Return tracks exist in the model but don't have graph nodes. Slice 11+ (Load Audio File → Clip) will introduce `AudioClipPlayerNode`; Group/Return wait until sends (Slice 23).
+- **Arm state survives undo of the armed track's deletion.** If you arm track A, delete A, undo → A is back but the `armed` flag is false (since the snapshot captured it pre-arm). Acceptable; users re-arm when they want to play. Could be revisited if annoying.
+- **The Track::instrument field on audio/return/group tracks is always None.** If we later introduce audio track instruments (e.g. for a Simpler sampler on an Audio track? Unlikely but possible), widen this then.
+- **Arm is not yet keyboard-accessible.** You have to click the R button; no shortcut like Alt+Number. Flag for polish.

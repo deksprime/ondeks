@@ -147,6 +147,34 @@ impl Project {
         self.tracks.iter().position(|t| t.id == id)
     }
 
+    /// Arm a single track exclusively, disarming all others. Returns the
+    /// previously-armed track id (if any) so callers that care about undo can
+    /// remember it; arm is intentionally non-undoable though — it's an
+    /// ephemeral routing flag, like transport Play/Stop.
+    pub fn arm_exclusive(&mut self, id: TrackId) -> Option<TrackId> {
+        let mut previously_armed: Option<TrackId> = None;
+        for track in self.tracks.iter_mut() {
+            if track.armed {
+                previously_armed = Some(track.id);
+            }
+            track.armed = track.id == id;
+        }
+        previously_armed
+    }
+
+    /// Disarm all tracks.
+    pub fn disarm_all(&mut self) {
+        for track in self.tracks.iter_mut() {
+            track.armed = false;
+        }
+    }
+
+    /// The currently-armed track, if any. Returns the first armed track if
+    /// multiple somehow end up armed (shouldn't happen via `arm_exclusive`).
+    pub fn armed_track(&self) -> Option<&Track> {
+        self.tracks.iter().find(|t| t.armed)
+    }
+
     /// Get a track by ID.
     pub fn get_track(&self, id: TrackId) -> Option<&Track> {
         self.tracks.iter().find(|t| t.id == id)

@@ -1,6 +1,6 @@
 //! Runtime host: owns the audio backend and drives the engine from the audio callback.
 
-use ondeks_core::{Command, Engine, NodeId};
+use ondeks_core::{Command, Engine};
 use ondeks_core::dsp::StereoBuffer;
 use crate::audio::{AudioBackend, AudioConfig, AudioDeviceInfo, AudioError, CpalBackend};
 use crate::queue::{CommandQueue, CommandSender, EventQueue, EventReceiver, RuntimeCommand, RuntimeEvent};
@@ -223,15 +223,6 @@ impl Host {
     /// Check if the host is currently running.
     pub fn is_running(&self) -> bool {
         self.backend.is_running()
-    }
-
-    /// Node ID of the built-in synth in the default engine graph.
-    ///
-    /// The UI uses this to target `Command::SendMidi { target, .. }`. Briefly
-    /// takes the state mutex; call during setup, not per-frame. Temporary
-    /// affordance until Slice 4 lands per-track instruments.
-    pub fn synth_node_id(&self) -> NodeId {
-        self.state.lock().unwrap().engine.synth_node_id()
     }
 }
 

@@ -3,9 +3,9 @@
 
 use crate::command::Command;
 use crate::dsp::StereoBuffer;
-use crate::ids::NodeId;
 use crate::graph::{AudioGraph, AudioNode, GraphProcessor, PortAddress, ProcessContext};
 use crate::graph::nodes::SynthNode;
+use crate::ids::NodeId;
 use crate::transport::Transport;
 
 /// The audio engine. One instance lives on the audio thread.
@@ -14,54 +14,20 @@ pub struct Engine {
     processor: GraphProcessor,
     transport: Transport,
     sample_rate: u32,
-    /// Node ID of the built-in synth in the default graph. The UI targets
-    /// MIDI at this node. Will be replaced by per-track instrument lookup
-    /// in Slice 4 (track CRUD) and beyond.
-    synth_node_id: NodeId,
 }
 
 impl Engine {
-    /// Create a new engine with a default "hello-world" graph: a built-in
-    /// polyphonic synth connected to the stereo output (both channels).
-    /// The synth responds to MIDI whether transport is playing or not.
+    /// Create a new engine with an **empty** graph — just the master output
+    /// node. Instrument nodes are added on demand via `Command::AddSynthNode`
+    /// as the UI creates MIDI tracks (Slice 5+).
     pub fn new(sample_rate: u32, buffer_size: usize) -> Self {
-        let mut graph = AudioGraph::new();
-
-        // Default demo graph: synth → output (L and R).
-        // Replaced in Slice 4 when users can build their own graphs.
-        let synth = SynthNode::new(sample_rate);
-        let synth_node_id = synth.id();
-        let synth_out_port = synth.outputs()[0].id;
-        graph.add_node_with_id(synth_node_id, Box::new(synth));
-
-        let output_id = graph.output();
-        let (left_in, right_in) = {
-            let output_node = graph
-                .get_node(output_id)
-                .expect("output node must exist after graph construction");
-            let inputs = output_node.inputs();
-            (inputs[0].id, inputs[1].id)
-        };
-
-        graph
-            .connect(
-                PortAddress::new(synth_node_id, synth_out_port),
-                PortAddress::new(output_id, left_in),
-            )
-            .expect("default connection (synth -> left) failed");
-        graph
-            .connect(
-                PortAddress::new(synth_node_id, synth_out_port),
-                PortAddress::new(output_id, right_in),
-            )
-            .expect("default connection (synth -> right) failed");
+        let graph = AudioGraph::new();
 
         Self {
             graph,
             processor: GraphProcessor::new(buffer_size),
             transport: Transport::new(sample_rate),
             sample_rate,
-            synth_node_id,
         }
     }
 
@@ -102,7 +68,51 @@ impl Engine {
                     node.handle_midi(&event, sample_offset);
                 }
             }
+            Command::AddSynthNode { node_id, track_id: _ } => {
+                self.add_synth_node(node_id);
+            }
+            Command::RemoveSynthNode { node_id } => {
+                self.remove_synth_node(node_id);
+            }
         }
+    }
+
+    /// Construct a `SynthNode` with the given id and wire its mono output to
+    /// both master inputs (L + R). No-op if the id already exists.
+    fn add_synth_node(&mut self, node_id: NodeId) {
+        if self.graph.get_node(node_id).is_some() {
+            return;
+        }
+        let synth = SynthNode::with_id(node_id, self.sample_rate);
+        let synth_out_port = synth.outputs()[0].id;
+        self.graph.add_node_with_id(node_id, Box::new(synth));
+
+        let output_id = self.graph.output();
+        let (left_in, right_in) = {
+            let output_node = self
+                .graph
+                .get_node(output_id)
+                .expect("output node must exist");
+            let inputs = output_node.inputs();
+            (inputs[0].id, inputs[1].id)
+        };
+
+        // Connection errors at this point indicate a bug (duplicate ports,
+        // cycle detected, etc.) — log and continue rather than panic so the
+        // audio thread stays alive.
+        let _ = self.graph.connect(
+            PortAddress::new(node_id, synth_out_port),
+            PortAddress::new(output_id, left_in),
+        );
+        let _ = self.graph.connect(
+            PortAddress::new(node_id, synth_out_port),
+            PortAddress::new(output_id, right_in),
+        );
+    }
+
+    /// Remove a node and all its connections. No-op if absent.
+    fn remove_synth_node(&mut self, node_id: NodeId) {
+        let _ = self.graph.remove_node(node_id);
     }
 
     /// Change the buffer size used by the processor. Typically called from
@@ -129,14 +139,6 @@ impl Engine {
     /// Get a reference to the audio graph.
     pub fn graph(&self) -> &AudioGraph {
         &self.graph
-    }
-
-    /// Node ID of the built-in synth in the default graph.
-    ///
-    /// UI code uses this to target `Command::SendMidi`. Temporary: Slice 4
-    /// replaces this with per-track instrument lookup.
-    pub fn synth_node_id(&self) -> NodeId {
-        self.synth_node_id
     }
 }
 

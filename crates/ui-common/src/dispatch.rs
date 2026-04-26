@@ -1,15 +1,22 @@
 //! Project command dispatcher with undo/redo support.
 //!
 //! Forward commands flow in, the dispatcher mutates `Project` and returns an
-//! `ApplyOutcome` that the caller uses to record a `HistoryEntry`. Inverse
+//! [`ApplyOutcome`] that the caller uses to record a `HistoryEntry`. Inverse
 //! commands (`undo`) can be fed back into [`apply_project_command`] to restore
 //! the previous state; they return their own inverse so redo works.
+//!
+//! As of Slice 5 the outcome also carries **engine commands** — audio-thread
+//! mutations that need to run alongside the project mutation (e.g. creating
+//! the graph node for a new MIDI track's instrument). The UI layer is
+//! responsible for forwarding these to the `Host`; the dispatcher itself is
+//! audio-thread-agnostic.
 //!
 //! The dispatcher is pure: given a `Project` and a command it mutates and
 //! emits an outcome, no hidden global state.
 
+use ondeks_core::Command as EngineCommand;
 use ondeks_core::ProjectError;
-use ondeks_core::project::Project;
+use ondeks_core::project::{Project, Track, TrackType};
 
 use crate::commands::ProjectCommand;
 
@@ -24,11 +31,22 @@ pub struct ApplyOutcome {
     /// new track snapshot; for other commands it's just the original command
     /// (applying it again is deterministic).
     pub redo: ProjectCommand,
+    /// Engine commands to forward to the audio thread. Typically graph
+    /// mutations (`AddSynthNode`, `RemoveSynthNode`) that track project
+    /// mutations. Empty for commands that don't affect the graph.
+    pub engine_commands: Vec<EngineCommand>,
+}
+
+impl ApplyOutcome {
+    fn project_only(undo: ProjectCommand, redo: ProjectCommand) -> Self {
+        Self { undo, redo, engine_commands: Vec::new() }
+    }
 }
 
 /// Apply a project command to `project`, returning the inverse + redo
-/// commands. If the command is itself an inverse produced by a previous call
-/// (e.g. `RestoreTrack`), the returned `undo` flips it back.
+/// commands and any engine commands that should mirror the mutation. If the
+/// command is itself an inverse produced by a previous call (e.g.
+/// `RestoreTrack`), the returned `undo` flips it back.
 ///
 /// This function is the single dispatch point for all project mutations that
 /// participate in undo/redo.
@@ -44,28 +62,33 @@ pub fn apply_project_command(
                 .expect("freshly added track must exist")
                 .clone();
             let insert_at = project.track_index(new_id).expect("just inserted");
+            let engine_commands = engine_commands_for_track(&track, true);
             Ok(ApplyOutcome {
                 undo: ProjectCommand::RemoveTrack { track_id: new_id },
                 redo: ProjectCommand::RestoreTrack {
                     track: Box::new(track),
                     insert_at,
                 },
+                engine_commands,
             })
         }
 
         ProjectCommand::RemoveTrack { track_id } => {
             let (track, index) = project.remove_track(*track_id)?;
+            let engine_commands = engine_commands_for_track(&track, false);
             Ok(ApplyOutcome {
                 undo: ProjectCommand::RestoreTrack {
                     track: Box::new(track),
                     insert_at: index,
                 },
                 redo: ProjectCommand::RemoveTrack { track_id: *track_id },
+                engine_commands,
             })
         }
 
         ProjectCommand::RestoreTrack { track, insert_at } => {
             let restored_id = track.id;
+            let engine_commands = engine_commands_for_track(track, true);
             project.insert_track_at((**track).clone(), *insert_at)?;
             Ok(ApplyOutcome {
                 undo: ProjectCommand::RemoveTrack { track_id: restored_id },
@@ -73,6 +96,7 @@ pub fn apply_project_command(
                     track: track.clone(),
                     insert_at: *insert_at,
                 },
+                engine_commands,
             })
         }
 
@@ -81,16 +105,16 @@ pub fn apply_project_command(
                 .get_track_mut(*track_id)
                 .ok_or(ProjectError::TrackNotFound(*track_id))?;
             let old_name = std::mem::replace(&mut track.name, name.clone());
-            Ok(ApplyOutcome {
-                undo: ProjectCommand::RenameTrack {
+            Ok(ApplyOutcome::project_only(
+                ProjectCommand::RenameTrack {
                     track_id: *track_id,
                     name: old_name,
                 },
-                redo: ProjectCommand::RenameTrack {
+                ProjectCommand::RenameTrack {
                     track_id: *track_id,
                     name: name.clone(),
                 },
-            })
+            ))
         }
 
         ProjectCommand::SetTrackColor { track_id, color } => {
@@ -99,30 +123,30 @@ pub fn apply_project_command(
                 .ok_or(ProjectError::TrackNotFound(*track_id))?;
             let old_color = track.color;
             track.color = *color;
-            Ok(ApplyOutcome {
-                undo: ProjectCommand::SetTrackColor {
+            Ok(ApplyOutcome::project_only(
+                ProjectCommand::SetTrackColor {
                     track_id: *track_id,
                     color: old_color,
                 },
-                redo: ProjectCommand::SetTrackColor {
+                ProjectCommand::SetTrackColor {
                     track_id: *track_id,
                     color: *color,
                 },
-            })
+            ))
         }
 
         ProjectCommand::MoveTrack { track_id, new_index } => {
             let old_index = project.move_track(*track_id, *new_index)?;
-            Ok(ApplyOutcome {
-                undo: ProjectCommand::MoveTrack {
+            Ok(ApplyOutcome::project_only(
+                ProjectCommand::MoveTrack {
                     track_id: *track_id,
                     new_index: old_index,
                 },
-                redo: ProjectCommand::MoveTrack {
+                ProjectCommand::MoveTrack {
                     track_id: *track_id,
                     new_index: *new_index,
                 },
-            })
+            ))
         }
 
         ProjectCommand::DuplicateTrack { track_id } => {
@@ -131,11 +155,17 @@ pub fn apply_project_command(
                 .ok_or(ProjectError::TrackNotFound(*track_id))?;
             let mut clone = source.clone();
             clone.id = ondeks_core::TrackId::generate();
+            // Fresh instrument id for MIDI tracks — the duplicate gets its
+            // own graph node.
+            if clone.track_type == TrackType::Midi {
+                clone.instrument = Some(ondeks_core::NodeId::generate());
+            }
             clone.name = format!("{} copy", clone.name);
             let source_index = project.track_index(*track_id).unwrap();
             let insert_at = source_index + 1;
             let clone_for_outcome = clone.clone();
             let new_id = clone.id;
+            let engine_commands = engine_commands_for_track(&clone, true);
             project.insert_track_at(clone, insert_at)?;
             Ok(ApplyOutcome {
                 undo: ProjectCommand::RemoveTrack { track_id: new_id },
@@ -143,7 +173,26 @@ pub fn apply_project_command(
                     track: Box::new(clone_for_outcome),
                     insert_at,
                 },
+                engine_commands,
             })
+        }
+
+        ProjectCommand::ArmTrack { track_id } => {
+            // Non-undoable: arm is ephemeral. We still return an outcome so
+            // the UI layer can treat the dispatcher uniformly — but the
+            // outcome carries no meaningful undo/redo and empty engine cmds.
+            // The UI layer skips history.record() for ArmTrack.
+            if project.get_track(*track_id).is_none() {
+                return Err(ProjectError::TrackNotFound(*track_id));
+            }
+            project.arm_exclusive(*track_id);
+            Ok(ApplyOutcome::project_only(
+                // Echo back the same command as both undo and redo so that if
+                // something does push this into history, replaying is still
+                // safe (idempotent).
+                ProjectCommand::ArmTrack { track_id: *track_id },
+                ProjectCommand::ArmTrack { track_id: *track_id },
+            ))
         }
 
         // Unimplemented variants: Scene CRUD and file ops are deferred to
@@ -167,6 +216,24 @@ pub fn apply_without_outcome(
     cmd: &ProjectCommand,
 ) -> Result<(), ProjectError> {
     apply_project_command(project, cmd).map(|_| ())
+}
+
+/// Produce engine commands appropriate for a track that is being added
+/// (`adding = true`) or removed (`adding = false`). MIDI tracks with a
+/// pre-assigned `instrument` node id drive `AddSynthNode` / `RemoveSynthNode`;
+/// other track types have no graph representation yet.
+fn engine_commands_for_track(track: &Track, adding: bool) -> Vec<EngineCommand> {
+    let Some(node_id) = track.instrument else {
+        return Vec::new();
+    };
+    if adding {
+        vec![EngineCommand::AddSynthNode {
+            node_id,
+            track_id: track.id,
+        }]
+    } else {
+        vec![EngineCommand::RemoveSynthNode { node_id }]
+    }
 }
 
 #[cfg(test)]
@@ -202,13 +269,88 @@ mod tests {
         let mut p = Project::new("t");
         let outcome = add(&mut p, "Bass");
         let before_id = p.tracks()[0].id;
+        let before_instrument = p.tracks()[0].instrument;
 
         apply_project_command(&mut p, &outcome.undo).unwrap();
         apply_project_command(&mut p, &outcome.redo).unwrap();
 
         assert_eq!(p.tracks().len(), 2);
-        // ID preserved through redo.
         assert_eq!(p.tracks()[0].id, before_id);
+        assert_eq!(
+            p.tracks()[0].instrument,
+            before_instrument,
+            "redo must preserve instrument node id"
+        );
+    }
+
+    #[test]
+    fn add_midi_track_emits_add_synth_node_engine_command() {
+        let mut p = Project::new("t");
+        let outcome = add(&mut p, "Bass");
+        let node_id = p.tracks()[0].instrument.expect("midi track has instrument");
+
+        assert_eq!(outcome.engine_commands.len(), 1);
+        match &outcome.engine_commands[0] {
+            EngineCommand::AddSynthNode { node_id: n, .. } => assert_eq!(*n, node_id),
+            c => panic!("expected AddSynthNode, got {c:?}"),
+        }
+    }
+
+    #[test]
+    fn add_audio_track_emits_no_engine_command() {
+        let mut p = Project::new("t");
+        let outcome = apply_project_command(
+            &mut p,
+            &ProjectCommand::AddTrack {
+                track_type: TrackType::Audio,
+                name: "Drums".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(outcome.engine_commands.is_empty());
+        assert!(p.tracks()[0].instrument.is_none());
+    }
+
+    #[test]
+    fn remove_midi_track_emits_remove_synth_node_engine_command() {
+        let mut p = Project::new("t");
+        let add_out = add(&mut p, "Bass");
+        let id = if let ProjectCommand::RemoveTrack { track_id } = add_out.undo {
+            track_id
+        } else {
+            unreachable!();
+        };
+        let node_id = p.get_track(id).unwrap().instrument.unwrap();
+
+        let rm = apply_project_command(
+            &mut p,
+            &ProjectCommand::RemoveTrack { track_id: id },
+        )
+        .unwrap();
+        assert_eq!(rm.engine_commands.len(), 1);
+        match &rm.engine_commands[0] {
+            EngineCommand::RemoveSynthNode { node_id: n } => assert_eq!(*n, node_id),
+            c => panic!("expected RemoveSynthNode, got {c:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_after_remove_reuses_same_node_id() {
+        let mut p = Project::new("t");
+        let _ = add(&mut p, "Bass");
+        let id = p.tracks()[0].id;
+        let node_id = p.tracks()[0].instrument.unwrap();
+
+        let rm = apply_project_command(&mut p, &ProjectCommand::RemoveTrack { track_id: id }).unwrap();
+        let restore_out = apply_project_command(&mut p, &rm.undo).unwrap();
+
+        // Restore must re-emit AddSynthNode with the original node id.
+        assert_eq!(restore_out.engine_commands.len(), 1);
+        match &restore_out.engine_commands[0] {
+            EngineCommand::AddSynthNode { node_id: n, .. } => assert_eq!(*n, node_id),
+            c => panic!("expected AddSynthNode, got {c:?}"),
+        }
+        assert_eq!(p.tracks()[0].instrument, Some(node_id));
     }
 
     #[test]
@@ -230,6 +372,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.get_track(id).unwrap().name, "Sub");
+        assert!(rename_out.engine_commands.is_empty());
 
         apply_project_command(&mut p, &rename_out.undo).unwrap();
         assert_eq!(p.get_track(id).unwrap().name, "Bass");
@@ -311,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_creates_new_id_and_undo_removes_it() {
+    fn duplicate_creates_new_id_and_fresh_instrument() {
         let mut p = Project::new("t");
         let a = add(&mut p, "A");
         let id = if let ProjectCommand::RemoveTrack { track_id } = a.undo {
@@ -319,6 +462,7 @@ mod tests {
         } else {
             unreachable!()
         };
+        let original_instrument = p.get_track(id).unwrap().instrument;
 
         let dup = apply_project_command(&mut p, &ProjectCommand::DuplicateTrack { track_id: id })
             .unwrap();
@@ -331,8 +475,33 @@ mod tests {
         assert_ne!(new_id, id);
         assert_eq!(p.get_track(new_id).unwrap().name, "A copy");
 
+        let new_instrument = p.get_track(new_id).unwrap().instrument;
+        assert_ne!(
+            new_instrument, original_instrument,
+            "duplicate must get a fresh instrument node id"
+        );
+
         apply_project_command(&mut p, &dup.undo).unwrap();
         assert!(p.get_track(new_id).is_none());
         assert_eq!(p.tracks().len(), 2);
+    }
+
+    #[test]
+    fn arm_exclusive_disarms_others() {
+        let mut p = Project::new("t");
+        let _ = add(&mut p, "A");
+        let _ = add(&mut p, "B");
+        let id_a = p.tracks()[0].id;
+        let id_b = p.tracks()[1].id;
+
+        apply_project_command(&mut p, &ProjectCommand::ArmTrack { track_id: id_a }).unwrap();
+        assert!(p.get_track(id_a).unwrap().armed);
+        assert!(!p.get_track(id_b).unwrap().armed);
+
+        apply_project_command(&mut p, &ProjectCommand::ArmTrack { track_id: id_b }).unwrap();
+        assert!(!p.get_track(id_a).unwrap().armed);
+        assert!(p.get_track(id_b).unwrap().armed);
+
+        assert_eq!(p.armed_track().map(|t| t.id), Some(id_b));
     }
 }

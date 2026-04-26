@@ -67,6 +67,9 @@ pub struct SessionViewResponse {
     pub rename_commit: Option<(TrackId, String)>,
     /// Inline rename cancelled (Esc).
     pub rename_cancel: bool,
+    /// User clicked the arm ("R") button on this track's header. Caller
+    /// should dispatch `ProjectCommand::ArmTrack` exclusively.
+    pub arm_track: Option<TrackId>,
 }
 
 /// Preset color palette for the track-header color picker.
@@ -134,6 +137,15 @@ impl<'a> SessionView<'a> {
                             egui::Sense::click_and_drag(),
                         );
 
+                        // Arm button sub-rect: small square in the upper-right.
+                        // Only MIDI tracks can be armed (they're the only type
+                        // that routes MIDI); render the button for them only.
+                        let arm_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.right() - 18.0, rect.top() + 4.0),
+                            egui::vec2(14.0, 14.0),
+                        );
+                        let is_midi = track.track_type == TrackType::Midi;
+
                         // Track header background
                         let bg_color = if header_resp.hovered() {
                             egui::Color32::from_gray(60)
@@ -149,14 +161,45 @@ impl<'a> SessionView<'a> {
                             color_to_egui(track.color),
                         );
 
-                        // Track name
+                        // Track name (centered in the area minus arm button)
+                        let name_center = egui::pos2(
+                            rect.center().x - if is_midi { 9.0 } else { 0.0 },
+                            rect.center().y,
+                        );
                         ui.painter().text(
-                            rect.center(),
+                            name_center,
                             egui::Align2::CENTER_CENTER,
                             &track.name,
                             egui::FontId::proportional(11.0),
                             egui::Color32::WHITE,
                         );
+
+                        // Arm button (MIDI tracks only).
+                        if is_midi {
+                            let arm_resp = ui.interact(
+                                arm_rect,
+                                ui.id().with(("arm", track.id.raw())),
+                                egui::Sense::click(),
+                            );
+                            let fill = if track.armed {
+                                egui::Color32::from_rgb(244, 67, 54)
+                            } else if arm_resp.hovered() {
+                                egui::Color32::from_gray(90)
+                            } else {
+                                egui::Color32::from_gray(70)
+                            };
+                            ui.painter().rect_filled(arm_rect, 2.0, fill);
+                            ui.painter().text(
+                                arm_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "R",
+                                egui::FontId::proportional(10.0),
+                                egui::Color32::WHITE,
+                            );
+                            if arm_resp.clicked() {
+                                response.arm_track = Some(track.id);
+                            }
+                        }
 
                         // Right-click context menu.
                         let mut picked: Option<TrackMenuAction> = None;

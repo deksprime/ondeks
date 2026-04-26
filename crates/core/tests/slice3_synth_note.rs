@@ -3,14 +3,27 @@
 //! Verifies the command → engine → node MIDI routing path end-to-end:
 //! `Command::SendMidi` delivered to the engine must reach the target node's
 //! `handle_midi` inbox and produce audio in the next `process()` call.
+//!
+//! Slice 5 removed the default demo synth, so each test explicitly adds a
+//! synth node via `Command::AddSynthNode` before routing MIDI to it.
 
 use ondeks_core::Command;
 use ondeks_core::dsp::StereoBuffer;
-use ondeks_core::{Engine, NodeId};
+use ondeks_core::{Engine, NodeId, TrackId};
 use ondeks_core::midi::{Channel, MidiEvent, Note, Velocity};
 
 const SR: u32 = 44100;
 const BLOCK: usize = 256;
+
+fn new_engine_with_synth() -> (Engine, NodeId) {
+    let mut engine = Engine::new(SR, BLOCK);
+    let node_id = NodeId::generate();
+    engine.apply_command(Command::AddSynthNode {
+        node_id,
+        track_id: TrackId::generate(),
+    });
+    (engine, node_id)
+}
 
 fn on(n: u8) -> MidiEvent {
     MidiEvent::NoteOn {
@@ -30,8 +43,7 @@ fn send(engine: &mut Engine, target: NodeId, event: MidiEvent) {
 
 #[test]
 fn command_send_midi_routes_to_synth() {
-    let mut engine = Engine::new(SR, BLOCK);
-    let target = engine.synth_node_id();
+    let (mut engine, target) = new_engine_with_synth();
 
     send(&mut engine, target, on(60));
 
@@ -43,7 +55,7 @@ fn command_send_midi_routes_to_synth() {
 
 #[test]
 fn send_midi_to_unknown_node_is_noop() {
-    let mut engine = Engine::new(SR, BLOCK);
+    let (mut engine, _) = new_engine_with_synth();
     let bogus = NodeId::from_raw(u64::MAX);
 
     // Must not panic.
@@ -56,8 +68,7 @@ fn send_midi_to_unknown_node_is_noop() {
 
 #[test]
 fn polyphony_multiple_notes_in_one_block() {
-    let mut engine = Engine::new(SR, BLOCK);
-    let target = engine.synth_node_id();
+    let (mut engine, target) = new_engine_with_synth();
 
     // Hit a triad.
     send(&mut engine, target, on(60));
@@ -69,8 +80,7 @@ fn polyphony_multiple_notes_in_one_block() {
 
     // Compare against single-note amplitude — three voices stack, so RMS
     // should be meaningfully higher than a single note at the same block size.
-    let mut solo_engine = Engine::new(SR, BLOCK);
-    let solo_target = solo_engine.synth_node_id();
+    let (mut solo_engine, solo_target) = new_engine_with_synth();
     send(&mut solo_engine, solo_target, on(60));
     let mut solo_out = StereoBuffer::allocate(BLOCK);
     solo_engine.process(&mut solo_out, BLOCK as u32);
@@ -85,8 +95,7 @@ fn polyphony_multiple_notes_in_one_block() {
 
 #[test]
 fn note_on_then_note_off_enters_release() {
-    let mut engine = Engine::new(SR, BLOCK);
-    let target = engine.synth_node_id();
+    let (mut engine, target) = new_engine_with_synth();
     let mut out = StereoBuffer::allocate(BLOCK);
 
     send(&mut engine, target, on(60));
@@ -95,7 +104,6 @@ fn note_on_then_note_off_enters_release() {
     assert!(attack_peak > 0.01);
 
     send(&mut engine, target, off(60));
-    // Many blocks later, amplitude should be noticeably reduced.
     for _ in 0..60 {
         out.silence();
         engine.process(&mut out, BLOCK as u32);
@@ -109,17 +117,12 @@ fn note_on_then_note_off_enters_release() {
 
 #[test]
 fn sample_offset_respected_within_block() {
-    // Sending the same NoteOn at offset 0 vs. mid-block yields different RMS
-    // (less integration time → less energy). This pins P0.2 sample-accurate
-    // timing through the full Command path.
-    let mut early = Engine::new(SR, BLOCK);
-    let target_e = early.synth_node_id();
+    let (mut early, target_e) = new_engine_with_synth();
     early.apply_command(Command::SendMidi { target: target_e, event: on(60), sample_offset: 0 });
     let mut out_e = StereoBuffer::allocate(BLOCK);
     early.process(&mut out_e, BLOCK as u32);
 
-    let mut late = Engine::new(SR, BLOCK);
-    let target_l = late.synth_node_id();
+    let (mut late, target_l) = new_engine_with_synth();
     late.apply_command(Command::SendMidi {
         target: target_l,
         event: on(60),

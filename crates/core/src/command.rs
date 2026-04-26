@@ -1,6 +1,6 @@
 //! Commands that can be sent to the audio engine.
 
-use crate::ids::NodeId;
+use crate::ids::{NodeId, TrackId};
 use crate::midi::MidiEvent;
 
 /// Commands that control the audio engine.
@@ -24,5 +24,26 @@ pub enum Command {
         event: MidiEvent,
         /// Sample offset within the current block (0 = block start).
         sample_offset: u32,
+    },
+    /// Insert a polyphonic `SynthNode` into the graph using the given id,
+    /// wire its mono output to both master input ports.
+    ///
+    /// `track_id` is informational for logging/debugging — the engine keys by
+    /// `node_id`. Callers (typically the UI dispatcher) pre-allocate the id
+    /// on the project's `Track::instrument` so node identity is stable across
+    /// undo/redo cycles.
+    AddSynthNode {
+        /// Id assigned to the new synth node. Must not already exist.
+        node_id: NodeId,
+        /// Track this synth belongs to (for logging/debug; engine ignores).
+        track_id: TrackId,
+    },
+    /// Disconnect and remove a synth node from the graph.
+    ///
+    /// No-op if the node does not exist (undo-of-remove is allowed to arrive
+    /// out of order during rapid-undo sequences).
+    RemoveSynthNode {
+        /// Id of the node to remove.
+        node_id: NodeId,
     },
 }

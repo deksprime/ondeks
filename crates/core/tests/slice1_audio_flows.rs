@@ -1,24 +1,25 @@
-//! Slice 1 + 2 + 3: verify that audio flows through the engine graph.
+//! Slice 1 + 2 + 3 (+ 5): verify that audio flows through the engine graph.
 //!
 //! These tests pin the end-to-end invariant: `Engine::process()` routes node
-//! output through the topological order into the stereo master. Slice 1/2
-//! originally tested this with an OscillatorNode gated by transport Play.
-//! Slice 3 replaced the default demo with a SynthNode that needs MIDI input,
-//! so these tests now drive the synth via `Command::SendMidi`.
-//!
-//! Structural invariants covered: silence without input, audio with input,
-//! transport advance semantics, cross-block continuity.
+//! output through the topological order into the stereo master. Slice 5
+//! removed the default demo graph — the engine now starts with just the
+//! master output. Tests construct a synth node explicitly via
+//! `Command::AddSynthNode` before driving MIDI.
 
 use ondeks_core::Command;
 use ondeks_core::dsp::StereoBuffer;
-use ondeks_core::Engine;
+use ondeks_core::{Engine, NodeId, TrackId};
 use ondeks_core::midi::{Channel, MidiEvent, Note, Velocity};
 
 const SR: u32 = 44100;
 const BLOCK: usize = 512;
 
-fn new_engine() -> Engine {
-    Engine::new(SR, BLOCK)
+fn new_engine_with_synth() -> (Engine, NodeId) {
+    let mut engine = Engine::new(SR, BLOCK);
+    let node_id = NodeId::generate();
+    let track_id = TrackId::generate();
+    engine.apply_command(Command::AddSynthNode { node_id, track_id });
+    (engine, node_id)
 }
 
 fn note_on(n: u8) -> MidiEvent {
@@ -34,34 +35,37 @@ fn note_off(n: u8) -> MidiEvent {
 }
 
 #[test]
-fn silence_with_no_midi() {
-    let mut engine = new_engine();
-    let mut out = StereoBuffer::allocate(BLOCK);
-
-    engine.process(&mut out, BLOCK as u32);
-
-    assert_eq!(out.left().peak(), 0.0, "left should be silent with no MIDI input");
-    assert_eq!(out.right().peak(), 0.0, "right should be silent with no MIDI input");
-}
-
-#[test]
-fn playing_without_midi_is_still_silent() {
-    // Unlike Slice 1's demo oscillator, the Slice 3 synth is driven by MIDI.
-    // Transport state alone should never produce sound.
-    let mut engine = new_engine();
-    engine.apply_command(Command::Play);
-
+fn empty_graph_is_silent() {
+    // Engine::new now creates an empty graph (just master). No synth until
+    // the UI sends AddSynthNode.
+    let mut engine = Engine::new(SR, BLOCK);
     let mut out = StereoBuffer::allocate(BLOCK);
     engine.process(&mut out, BLOCK as u32);
-
     assert_eq!(out.left().peak(), 0.0);
     assert_eq!(out.right().peak(), 0.0);
 }
 
 #[test]
+fn silence_with_no_midi() {
+    let (mut engine, _) = new_engine_with_synth();
+    let mut out = StereoBuffer::allocate(BLOCK);
+    engine.process(&mut out, BLOCK as u32);
+    assert_eq!(out.left().peak(), 0.0, "silent synth without MIDI");
+    assert_eq!(out.right().peak(), 0.0);
+}
+
+#[test]
+fn playing_without_midi_is_still_silent() {
+    let (mut engine, _) = new_engine_with_synth();
+    engine.apply_command(Command::Play);
+    let mut out = StereoBuffer::allocate(BLOCK);
+    engine.process(&mut out, BLOCK as u32);
+    assert_eq!(out.left().peak(), 0.0);
+}
+
+#[test]
 fn note_on_produces_stereo_audio() {
-    let mut engine = new_engine();
-    let target = engine.synth_node_id();
+    let (mut engine, target) = new_engine_with_synth();
     engine.apply_command(Command::SendMidi {
         target,
         event: note_on(60),
@@ -76,14 +80,12 @@ fn note_on_produces_stereo_audio() {
 
     assert!(lp > 0.01, "left peak should be non-zero, got {lp}");
     assert!(rp > 0.01, "right peak should be non-zero, got {rp}");
-    // Mono synth routed to both channels → equal peaks.
     assert!((lp - rp).abs() < 1e-6, "L and R should match (mono routed to both)");
 }
 
 #[test]
 fn note_off_decays_over_time() {
-    let mut engine = new_engine();
-    let target = engine.synth_node_id();
+    let (mut engine, target) = new_engine_with_synth();
     let mut out = StereoBuffer::allocate(BLOCK);
 
     engine.apply_command(Command::SendMidi { target, event: note_on(60), sample_offset: 0 });
@@ -92,7 +94,6 @@ fn note_off_decays_over_time() {
     assert!(peak_with_note > 0.01);
 
     engine.apply_command(Command::SendMidi { target, event: note_off(60), sample_offset: 0 });
-    // Skip ahead several blocks to let the release envelope progress.
     for _ in 0..40 {
         out.silence();
         engine.process(&mut out, BLOCK as u32);
@@ -106,16 +107,14 @@ fn note_off_decays_over_time() {
 
 #[test]
 fn transport_advances_only_when_playing() {
-    let mut engine = new_engine();
+    let (mut engine, _) = new_engine_with_synth();
     let mut out = StereoBuffer::allocate(BLOCK);
 
     let pos_before = engine.transport().position().0;
 
-    // Stopped: transport must not advance.
     engine.process(&mut out, BLOCK as u32);
-    assert_eq!(engine.transport().position().0, pos_before, "stopped transport must not advance");
+    assert_eq!(engine.transport().position().0, pos_before);
 
-    // Playing: advances by `frames` per process.
     engine.apply_command(Command::Play);
     engine.process(&mut out, BLOCK as u32);
     assert_eq!(engine.transport().position().0, pos_before + BLOCK as u64);
@@ -123,10 +122,7 @@ fn transport_advances_only_when_playing() {
 
 #[test]
 fn held_note_is_continuous_across_blocks() {
-    // Synth state persists across process calls — no click at block boundaries
-    // while a note is held.
-    let mut engine = new_engine();
-    let target = engine.synth_node_id();
+    let (mut engine, target) = new_engine_with_synth();
     engine.apply_command(Command::SendMidi { target, event: note_on(60), sample_offset: 0 });
 
     let mut out_a = StereoBuffer::allocate(BLOCK);
@@ -140,8 +136,6 @@ fn held_note_is_continuous_across_blocks() {
 
     let last_a = out_a.left()[BLOCK - 1];
     let first_b = out_b.left()[0];
-    // The synth's filter/envelope smooths transitions; allow generous tolerance
-    // relative to typical sample deltas, but still catch a discontinuity spike.
     assert!(
         (last_a - first_b).abs() < 0.2,
         "block boundary discontinuity: last_a={last_a}, first_b={first_b}"

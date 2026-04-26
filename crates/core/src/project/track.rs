@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::ids::{TrackId, ClipId, Color};
+use crate::ids::{TrackId, ClipId, Color, NodeId};
 use crate::dsp::Sample;
 use crate::transport::Beats;
 
@@ -35,29 +35,43 @@ pub struct Track {
     pub name: String,
     pub track_type: TrackType,
     pub color: Color,
-    
+
     // Mixer state
     pub volume_db: f32,
     pub pan: f32,
     pub muted: bool,
     pub soloed: bool,
     pub armed: bool,
-    
+
+    /// Graph node id of this track's instrument (MIDI tracks only).
+    ///
+    /// Assigned when the track is created so the UI dispatcher and the audio
+    /// graph share the same id — lets undo/redo preserve node identity the
+    /// same way it preserves `TrackId`. `None` for audio, group, return and
+    /// master tracks.
+    pub instrument: Option<NodeId>,
+
     // Arrangement clips
     pub arrangement_clips: Vec<ArrangementClip>,
-    
+
     // Session clip slots (index = scene index, None = empty slot)
     pub session_slots: Vec<Option<ClipId>>,
-    
+
     // Send levels to return tracks
     pub sends: HashMap<TrackId, f32>,
-    
+
     // Parent group (if any)
     pub parent: Option<TrackId>,
 }
 
 impl Track {
     pub fn new(track_type: TrackType, name: impl Into<String>) -> Self {
+        // Allocate a fresh instrument node id up front for MIDI tracks so the
+        // graph node and the track share identity.
+        let instrument = match track_type {
+            TrackType::Midi => Some(NodeId::generate()),
+            _ => None,
+        };
         Self {
             id: TrackId::generate(),
             name: name.into(),
@@ -68,6 +82,7 @@ impl Track {
             muted: false,
             soloed: false,
             armed: false,
+            instrument,
             arrangement_clips: Vec::new(),
             session_slots: Vec::new(),
             sends: HashMap::new(),

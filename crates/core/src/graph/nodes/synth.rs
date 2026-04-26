@@ -31,8 +31,17 @@ pub struct SynthNode {
 impl SynthNode {
     /// Create a new synth node with the given sample rate.
     pub fn new(sample_rate: u32) -> Self {
+        Self::with_id(NodeId::generate(), sample_rate)
+    }
+
+    /// Create a synth node using a caller-supplied id.
+    ///
+    /// Lets the UI dispatcher pre-allocate the node id on the `Track` so the
+    /// graph node and the project's `Track::instrument` share identity — the
+    /// same determinism trick used for `TrackId` across undo/redo cycles.
+    pub fn with_id(id: NodeId, sample_rate: u32) -> Self {
         Self {
-            id: NodeId::generate(),
+            id,
             synth: SimpleSynth::new(sample_rate),
             inbox: Vec::with_capacity(MIDI_INBOX_CAPACITY),
             outputs: vec![OutputPort::audio("out")],

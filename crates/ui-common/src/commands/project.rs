@@ -32,6 +32,10 @@ pub enum ProjectCommand {
     MoveTrack { track_id: TrackId, new_index: usize },
     /// Set a track's display color.
     SetTrackColor { track_id: TrackId, color: Color },
+    /// Arm a track exclusively for MIDI input. All other tracks are disarmed.
+    /// **Not undoable** — arm is an ephemeral routing flag, like transport
+    /// Play/Stop.
+    ArmTrack { track_id: TrackId },
 
     // --- Inverse / internal (produced by the dispatcher for undo) ---
     /// Restore a previously-removed track at its original index. Used as the
@@ -67,6 +71,7 @@ impl ProjectCommand {
             Self::DuplicateTrack { .. } => "Duplicate Track",
             Self::MoveTrack { .. } => "Move Track",
             Self::SetTrackColor { .. } => "Set Track Color",
+            Self::ArmTrack { .. } => "Arm Track",
             Self::RestoreTrack { .. } => "Restore Track",
             Self::AddScene { .. } => "Add Scene",
             Self::RemoveScene { .. } => "Remove Scene",
