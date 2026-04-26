@@ -11,7 +11,11 @@ pub mod selection;
 pub mod traits;
 pub mod viewmodels;
 pub mod commands;
+pub mod dispatch;
 pub mod history;
+pub mod shortcuts;
+pub mod theme;
+pub mod preferences;
 
 // Re-exports
 pub use types::*;
@@ -19,4 +23,8 @@ pub use selection::*;
 pub use traits::*;
 pub use viewmodels::*;
 pub use commands::UiCommand;
+pub use dispatch::{apply_project_command, apply_without_outcome, ApplyOutcome};
 pub use history::{History, HistoryEntry};
+pub use shortcuts::{Shortcut, ShortcutMap, ShortcutAction};
+pub use theme::{Theme, ThemeColor};
+pub use preferences::Preferences;

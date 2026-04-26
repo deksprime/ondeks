@@ -40,7 +40,7 @@ pub struct KeyEvent {
 }
 
 /// Keyboard keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     // Letters
     A, B, C, D, E, F, G, H, I, J, K, L, M,
@@ -58,7 +58,7 @@ pub enum Key {
 }
 
 /// Modifier keys.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Modifiers {
     pub ctrl: bool,
     pub shift: bool,

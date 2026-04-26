@@ -89,8 +89,8 @@ impl Project {
         id
     }
 
-    /// Remove a track.
-    pub fn remove_track(&mut self, id: TrackId) -> Result<(), ProjectError> {
+    /// Remove a track, returning the removed track and its index for undo.
+    pub fn remove_track(&mut self, id: TrackId) -> Result<(Track, usize), ProjectError> {
         if id == self.master_id {
             return Err(ProjectError::CannotRemoveMaster);
         }
@@ -99,8 +99,80 @@ impl Project {
             .position(|t| t.id == id)
             .ok_or(ProjectError::TrackNotFound(id))?;
 
-        self.tracks.remove(pos);
+        let track = self.tracks.remove(pos);
+        Ok((track, pos))
+    }
+
+    /// Insert a pre-constructed track at a specific index, shifting existing tracks.
+    ///
+    /// Used for undo of [`remove_track`] and for undo of [`move_track`]. Clamps
+    /// `insert_at` so master stays last. Returns an error if master is inserted
+    /// or if a duplicate ID already exists.
+    pub fn insert_track_at(&mut self, track: Track, insert_at: usize) -> Result<(), ProjectError> {
+        if track.track_type == TrackType::Master {
+            return Err(ProjectError::CannotRemoveMaster);
+        }
+        if self.tracks.iter().any(|t| t.id == track.id) {
+            return Err(ProjectError::TrackNotFound(track.id));
+        }
+        let master_pos = self.tracks.iter().position(|t| t.id == self.master_id).unwrap();
+        let clamped = insert_at.min(master_pos);
+        self.tracks.insert(clamped, track);
         Ok(())
+    }
+
+    /// Move a track to a new index (excluding master). Clamps so master stays last.
+    pub fn move_track(&mut self, id: TrackId, new_index: usize) -> Result<usize, ProjectError> {
+        if id == self.master_id {
+            return Err(ProjectError::CannotRemoveMaster);
+        }
+        let old_pos = self.tracks.iter()
+            .position(|t| t.id == id)
+            .ok_or(ProjectError::TrackNotFound(id))?;
+        let master_pos = self.tracks.iter().position(|t| t.id == self.master_id).unwrap();
+        // Upper bound is master_pos - 1 since master must remain last.
+        let max_index = master_pos.saturating_sub(if old_pos < master_pos { 1 } else { 0 });
+        let clamped = new_index.min(max_index);
+        if clamped == old_pos {
+            return Ok(old_pos);
+        }
+        let track = self.tracks.remove(old_pos);
+        let adjusted = if clamped > old_pos { clamped } else { clamped };
+        self.tracks.insert(adjusted, track);
+        Ok(old_pos)
+    }
+
+    /// Index of a track in the track list, or None if not found.
+    pub fn track_index(&self, id: TrackId) -> Option<usize> {
+        self.tracks.iter().position(|t| t.id == id)
+    }
+
+    /// Arm a single track exclusively, disarming all others. Returns the
+    /// previously-armed track id (if any) so callers that care about undo can
+    /// remember it; arm is intentionally non-undoable though — it's an
+    /// ephemeral routing flag, like transport Play/Stop.
+    pub fn arm_exclusive(&mut self, id: TrackId) -> Option<TrackId> {
+        let mut previously_armed: Option<TrackId> = None;
+        for track in self.tracks.iter_mut() {
+            if track.armed {
+                previously_armed = Some(track.id);
+            }
+            track.armed = track.id == id;
+        }
+        previously_armed
+    }
+
+    /// Disarm all tracks.
+    pub fn disarm_all(&mut self) {
+        for track in self.tracks.iter_mut() {
+            track.armed = false;
+        }
+    }
+
+    /// The currently-armed track, if any. Returns the first armed track if
+    /// multiple somehow end up armed (shouldn't happen via `arm_exclusive`).
+    pub fn armed_track(&self) -> Option<&Track> {
+        self.tracks.iter().find(|t| t.armed)
     }
 
     /// Get a track by ID.

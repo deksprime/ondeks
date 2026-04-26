@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::ids::{TrackId, ClipId, Color};
+use crate::ids::{TrackId, ClipId, Color, NodeId};
 use crate::dsp::Sample;
 use crate::transport::Beats;
 
@@ -35,29 +35,50 @@ pub struct Track {
     pub name: String,
     pub track_type: TrackType,
     pub color: Color,
-    
+
     // Mixer state
     pub volume_db: f32,
     pub pan: f32,
     pub muted: bool,
     pub soloed: bool,
     pub armed: bool,
-    
+
+    /// Graph node id of this track's instrument (MIDI tracks only).
+    ///
+    /// Assigned when the track is created so the UI dispatcher and the audio
+    /// graph share the same id — lets undo/redo preserve node identity the
+    /// same way it preserves `TrackId`. `None` for audio, group, return and
+    /// master tracks.
+    pub instrument: Option<NodeId>,
+
+    /// Graph node id of this track's channel strip (mixer node).
+    ///
+    /// Currently set for MIDI tracks alongside their instrument. Audio /
+    /// group / return / master tracks don't have a per-track strip yet
+    /// (they'll get one when their audio paths land in later slices).
+    pub channel_strip: Option<NodeId>,
+
     // Arrangement clips
     pub arrangement_clips: Vec<ArrangementClip>,
-    
+
     // Session clip slots (index = scene index, None = empty slot)
     pub session_slots: Vec<Option<ClipId>>,
-    
+
     // Send levels to return tracks
     pub sends: HashMap<TrackId, f32>,
-    
+
     // Parent group (if any)
     pub parent: Option<TrackId>,
 }
 
 impl Track {
     pub fn new(track_type: TrackType, name: impl Into<String>) -> Self {
+        // Allocate fresh node ids up front for MIDI tracks so the graph
+        // nodes and the project share identity through undo/redo.
+        let (instrument, channel_strip) = match track_type {
+            TrackType::Midi => (Some(NodeId::generate()), Some(NodeId::generate())),
+            _ => (None, None),
+        };
         Self {
             id: TrackId::generate(),
             name: name.into(),
@@ -68,6 +89,8 @@ impl Track {
             muted: false,
             soloed: false,
             armed: false,
+            instrument,
+            channel_strip,
             arrangement_clips: Vec::new(),
             session_slots: Vec::new(),
             sends: HashMap::new(),
