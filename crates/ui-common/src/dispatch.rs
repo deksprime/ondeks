@@ -196,8 +196,139 @@ pub fn apply_project_command(
             ))
         }
 
+        // ----- MIDI note CRUD (Slice 8 piano roll) -----
+        ProjectCommand::AddMidiNote { clip_id, note } => {
+            let clip = project
+                .get_midi_clip_mut(*clip_id)
+                .ok_or(ProjectError::ClipNotFound(*clip_id))?;
+            clip.notes.push(*note);
+            let note_index = clip.notes.len() - 1;
+            Ok(ApplyOutcome::project_only(
+                ProjectCommand::RemoveMidiNote { clip_id: *clip_id, note_index },
+                ProjectCommand::RestoreMidiNote {
+                    clip_id: *clip_id,
+                    note_index,
+                    note: *note,
+                },
+            ))
+        }
+        ProjectCommand::RemoveMidiNote { clip_id, note_index } => {
+            let clip = project
+                .get_midi_clip_mut(*clip_id)
+                .ok_or(ProjectError::ClipNotFound(*clip_id))?;
+            if *note_index >= clip.notes.len() {
+                return Err(ProjectError::Unsupported(format!(
+                    "note_index {} out of range",
+                    note_index
+                )));
+            }
+            let removed = clip.notes.remove(*note_index);
+            Ok(ApplyOutcome::project_only(
+                ProjectCommand::RestoreMidiNote {
+                    clip_id: *clip_id,
+                    note_index: *note_index,
+                    note: removed,
+                },
+                ProjectCommand::RemoveMidiNote { clip_id: *clip_id, note_index: *note_index },
+            ))
+        }
+        ProjectCommand::RestoreMidiNote { clip_id, note_index, note } => {
+            let clip = project
+                .get_midi_clip_mut(*clip_id)
+                .ok_or(ProjectError::ClipNotFound(*clip_id))?;
+            let idx = (*note_index).min(clip.notes.len());
+            clip.notes.insert(idx, *note);
+            Ok(ApplyOutcome::project_only(
+                ProjectCommand::RemoveMidiNote { clip_id: *clip_id, note_index: idx },
+                ProjectCommand::RestoreMidiNote {
+                    clip_id: *clip_id,
+                    note_index: idx,
+                    note: *note,
+                },
+            ))
+        }
+        ProjectCommand::MoveMidiNote { clip_id, note_index, new_time, new_pitch } => {
+            let clip = project
+                .get_midi_clip_mut(*clip_id)
+                .ok_or(ProjectError::ClipNotFound(*clip_id))?;
+            let n = clip
+                .notes
+                .get_mut(*note_index)
+                .ok_or_else(|| {
+                    ProjectError::Unsupported(format!("note_index {} out of range", note_index))
+                })?;
+            let old_time = n.time;
+            let old_pitch = n.pitch;
+            n.time = *new_time;
+            n.pitch = *new_pitch;
+            Ok(ApplyOutcome::project_only(
+                ProjectCommand::MoveMidiNote {
+                    clip_id: *clip_id,
+                    note_index: *note_index,
+                    new_time: old_time,
+                    new_pitch: old_pitch,
+                },
+                ProjectCommand::MoveMidiNote {
+                    clip_id: *clip_id,
+                    note_index: *note_index,
+                    new_time: *new_time,
+                    new_pitch: *new_pitch,
+                },
+            ))
+        }
+        ProjectCommand::ResizeMidiNote { clip_id, note_index, new_length } => {
+            let clip = project
+                .get_midi_clip_mut(*clip_id)
+                .ok_or(ProjectError::ClipNotFound(*clip_id))?;
+            let n = clip
+                .notes
+                .get_mut(*note_index)
+                .ok_or_else(|| {
+                    ProjectError::Unsupported(format!("note_index {} out of range", note_index))
+                })?;
+            let old_length = n.length;
+            n.length = *new_length;
+            Ok(ApplyOutcome::project_only(
+                ProjectCommand::ResizeMidiNote {
+                    clip_id: *clip_id,
+                    note_index: *note_index,
+                    new_length: old_length,
+                },
+                ProjectCommand::ResizeMidiNote {
+                    clip_id: *clip_id,
+                    note_index: *note_index,
+                    new_length: *new_length,
+                },
+            ))
+        }
+        ProjectCommand::SetNoteVelocity { clip_id, note_index, new_velocity } => {
+            let clip = project
+                .get_midi_clip_mut(*clip_id)
+                .ok_or(ProjectError::ClipNotFound(*clip_id))?;
+            let n = clip
+                .notes
+                .get_mut(*note_index)
+                .ok_or_else(|| {
+                    ProjectError::Unsupported(format!("note_index {} out of range", note_index))
+                })?;
+            let old_velocity = n.velocity;
+            n.velocity = *new_velocity;
+            Ok(ApplyOutcome::project_only(
+                ProjectCommand::SetNoteVelocity {
+                    clip_id: *clip_id,
+                    note_index: *note_index,
+                    new_velocity: old_velocity,
+                },
+                ProjectCommand::SetNoteVelocity {
+                    clip_id: *clip_id,
+                    note_index: *note_index,
+                    new_velocity: *new_velocity,
+                },
+            ))
+        }
+
         // Unimplemented variants: Scene CRUD and file ops are deferred to
-        // later slices (Slice 7 covers Save/Load, Slice 9 adds scene CRUD).
+        // later slices (Slice 9 adds scene CRUD).
         ProjectCommand::New { .. }
         | ProjectCommand::Save { .. }
         | ProjectCommand::Load { .. }

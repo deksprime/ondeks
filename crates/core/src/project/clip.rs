@@ -1,6 +1,6 @@
 use crate::ids::{ClipId, AudioPoolId, Color};
 use crate::transport::Beats;
-use crate::midi::MidiSequence;
+use crate::midi::{Channel, MidiSequence, Note, Velocity};
 
 /// Common clip metadata.
 #[derive(Debug, Clone)]
@@ -22,11 +22,50 @@ impl ClipHeader {
     }
 }
 
-/// A MIDI clip containing a sequence of events.
+/// A single editable note in a MIDI clip.
+///
+/// This is the high-level note abstraction the piano roll edits — a
+/// rectangle on the grid with start time, length, pitch, velocity. At
+/// playback time (Slice 9) each `MidiNote` is lowered into a `NoteOn` /
+/// `NoteOff` pair on the synth's MIDI inbox.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MidiNote {
+    /// Note start time in beats from the clip start.
+    pub time: Beats,
+    /// Note length in beats.
+    pub length: Beats,
+    /// MIDI pitch (0-127).
+    pub pitch: Note,
+    /// Note-on velocity (0-127).
+    pub velocity: Velocity,
+    /// MIDI channel (0-15).
+    pub channel: Channel,
+}
+
+impl MidiNote {
+    /// Create a new note. Defaults to channel 0, velocity 100.
+    pub fn new(time: Beats, length: Beats, pitch: Note) -> Self {
+        Self {
+            time,
+            length,
+            pitch,
+            velocity: Velocity::new(100).expect("100 is a valid velocity"),
+            channel: Channel::new(0).expect("0 is a valid channel"),
+        }
+    }
+}
+
+/// A MIDI clip — a list of editable notes plus a legacy event sequence.
+///
+/// `notes` is the primary editable surface (piano roll edits go here).
+/// `sequence` survives for control-change / pitch-bend / aftertouch events
+/// that don't fit the note rectangle abstraction; for note-only clips it
+/// stays empty.
 #[derive(Debug, Clone)]
 pub struct MidiClip {
     pub header: ClipHeader,
     pub sequence: MidiSequence,
+    pub notes: Vec<MidiNote>,
 }
 
 impl MidiClip {
@@ -34,6 +73,7 @@ impl MidiClip {
         Self {
             header: ClipHeader::new(name, length),
             sequence: MidiSequence::with_length(length),
+            notes: Vec::new(),
         }
     }
 

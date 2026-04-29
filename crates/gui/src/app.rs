@@ -11,12 +11,14 @@ use ondeks_ui_common::{
     apply_project_command,
     commands::ProjectCommand,
 };
-use ondeks_core::TrackId;
+use ondeks_core::{ClipId, TrackId};
+use ondeks_core::midi::{Channel, MidiEvent, Note as MidiPitch, Velocity};
 use ondeks_core::persistence::{project_from_json, project_to_json};
-use ondeks_core::project::{Project, TrackType};
+use ondeks_core::project::{Clip, MidiClip, MidiNote, Project, TrackType};
+use ondeks_core::transport::Beats;
 use ondeks_core::session::SlotState;
 use ondeks_core::transport::Transport;
-use crate::views::{SessionView, TrackMenuAction};
+use crate::views::{DragState, PianoRollView, SessionView, TrackMenuAction};
 use crate::widgets::{TransportControls, PositionDisplay, TempoEditor, LevelMeter, PianoKeyboard};
 
 /// The view currently displayed.
@@ -25,6 +27,14 @@ pub enum CurrentView {
     #[default]
     Session,
     Arrangement,
+    /// Piano roll editor focused on a specific MIDI clip. The clip belongs
+    /// to a session slot owned by `track_id` × `scene_idx`; we keep both for
+    /// preview-on-draw routing (use the track's instrument node id).
+    PianoRoll {
+        clip_id: ClipId,
+        track_id: TrackId,
+        scene_idx: usize,
+    },
 }
 
 /// Main application state.
@@ -69,6 +79,15 @@ pub struct OndeksApp {
     /// "Saved Xs ago" indicator so silent saves (Ctrl+S after a path is set)
     /// give visible feedback.
     last_save_at: Option<Instant>,
+
+    // ----- Piano roll editing state (Slice 8) -----
+    /// Selected note index within the piano-roll clip, if any.
+    piano_roll_selected: Option<usize>,
+    /// In-flight drag state for the piano roll (move / resize).
+    piano_roll_drag: DragState,
+    /// MIDI notes that the piano roll preview-fired; we owe them a NoteOff
+    /// at the corresponding `Instant` to avoid stuck-note voices.
+    pending_preview_offs: Vec<(Instant, ondeks_core::NodeId, MidiPitch)>,
 }
 
 impl OndeksApp {
@@ -120,6 +139,9 @@ impl OndeksApp {
             project_path: None,
             is_dirty: false,
             last_save_at: None,
+            piano_roll_selected: None,
+            piano_roll_drag: DragState::default(),
+            pending_preview_offs: Vec::new(),
         }
     }
 
@@ -469,6 +491,9 @@ impl OndeksApp {
         match self.current_view {
             CurrentView::Session => self.render_session_view(ui),
             CurrentView::Arrangement => self.render_arrangement_view(ui),
+            CurrentView::PianoRoll { clip_id, track_id, .. } => {
+                self.render_piano_roll(ui, clip_id, track_id)
+            }
         }
     }
 
@@ -493,6 +518,9 @@ impl OndeksApp {
         if let Some((track, scene)) = response.slot_clicked {
             self.selection.select(SelectableItem::SessionSlot { track, scene });
             tracing::info!("Session slot clicked: track={}, scene={}", track, scene);
+        }
+        if let Some((track_idx, scene_idx)) = response.slot_double_clicked {
+            self.open_or_create_clip_in_slot(track_idx, scene_idx);
         }
         if let Some(scene) = response.scene_launched {
             tracing::info!("Scene launched: {}", scene);
@@ -590,6 +618,182 @@ impl OndeksApp {
                 self.dispatch_project_command(ProjectCommand::ArmTrack { track_id });
             }
         }
+    }
+
+    /// Open the piano roll on the clip in (track_idx, scene_idx). If the slot
+    /// is empty, create a new MIDI clip first and place it there.
+    /// Audio tracks are skipped (they don't have MIDI clips).
+    fn open_or_create_clip_in_slot(&mut self, track_idx: usize, scene_idx: usize) {
+        let Some(track_vm) = self.session_vm.track_headers.get(track_idx) else {
+            return;
+        };
+        if track_vm.track_type != TrackType::Midi {
+            tracing::info!("piano roll only supports MIDI tracks");
+            return;
+        }
+        let track_id = track_vm.id;
+
+        // Find existing clip in slot or create one.
+        let existing = self
+            .project
+            .get_track(track_id)
+            .and_then(|t| t.session_slots.get(scene_idx).copied())
+            .flatten();
+        let clip_id = if let Some(id) = existing {
+            id
+        } else {
+            let midi_clip = MidiClip::new(
+                format!("Pattern {}", scene_idx + 1),
+                Beats(4.0),
+            );
+            let id = midi_clip.id();
+            self.project.add_clip(Clip::Midi(midi_clip));
+            if let Some(t) = self.project.get_track_mut(track_id) {
+                t.set_session_slot(scene_idx, Some(id));
+            }
+            self.mark_dirty();
+            self.rebuild_view_models();
+            id
+        };
+
+        self.current_view = CurrentView::PianoRoll {
+            clip_id,
+            track_id,
+            scene_idx,
+        };
+        self.piano_roll_selected = None;
+        self.piano_roll_drag = DragState::default();
+    }
+
+    /// Render the piano roll editor for the clip in `current_view`.
+    fn render_piano_roll(
+        &mut self,
+        ui: &mut egui::Ui,
+        clip_id: ClipId,
+        track_id: TrackId,
+    ) {
+        // Snapshot the clip's notes + length so the borrow doesn't conflict
+        // with self.dispatch_project_command later.
+        let (notes, length) = match self.project.get_clip(clip_id) {
+            Some(Clip::Midi(c)) => (c.notes.clone(), c.header.length),
+            _ => {
+                ui.label("Clip not found.");
+                if ui.button("← Back to Session").clicked() {
+                    self.current_view = CurrentView::Session;
+                }
+                return;
+            }
+        };
+
+        let view = PianoRollView::new(
+            &notes,
+            length,
+            self.piano_roll_selected,
+            &mut self.piano_roll_drag,
+        );
+        let response = view.show(ui);
+
+        if let Some((time, pitch)) = response.add_note {
+            let new_note = MidiNote::new(time, Beats(0.125), pitch);
+            self.dispatch_project_command(ProjectCommand::AddMidiNote {
+                clip_id,
+                note: new_note,
+            });
+            // Select the freshly-added note so subsequent Delete acts on it.
+            if let Some(Clip::Midi(c)) = self.project.get_clip(clip_id) {
+                self.piano_roll_selected = Some(c.notes.len().saturating_sub(1));
+            }
+            self.preview_note(track_id, pitch);
+        }
+        // Pitch previews from clicking the keyboard strip or scrubbing
+        // through pitches while dragging a note vertically.
+        if let Some(pitch) = response.preview_pitch {
+            self.preview_note(track_id, pitch);
+        }
+        if let Some(sel) = response.set_selected {
+            self.piano_roll_selected = sel;
+        }
+        if let Some((idx, new_time, new_pitch)) = response.commit_move {
+            self.dispatch_project_command(ProjectCommand::MoveMidiNote {
+                clip_id,
+                note_index: idx,
+                new_time,
+                new_pitch,
+            });
+        }
+        if let Some((idx, new_length)) = response.commit_resize {
+            self.dispatch_project_command(ProjectCommand::ResizeMidiNote {
+                clip_id,
+                note_index: idx,
+                new_length,
+            });
+        }
+        if response.delete_selected {
+            if let Some(idx) = self.piano_roll_selected {
+                self.dispatch_project_command(ProjectCommand::RemoveMidiNote {
+                    clip_id,
+                    note_index: idx,
+                });
+                self.piano_roll_selected = None;
+            }
+        }
+        if response.close_clicked {
+            self.current_view = CurrentView::Session;
+            self.piano_roll_selected = None;
+            self.piano_roll_drag = DragState::default();
+        }
+    }
+
+    /// Briefly trigger the track's instrument so the user hears the note
+    /// they just placed. Note-off is queued via `pending_preview_offs` and
+    /// fires from `update()` after a short delay.
+    fn preview_note(&mut self, track_id: TrackId, pitch: MidiPitch) {
+        let Some(node_id) = self
+            .project
+            .get_track(track_id)
+            .and_then(|t| t.instrument)
+        else {
+            return;
+        };
+        let channel = Channel::new(0).expect("channel 0");
+        let velocity = Velocity::new(100).expect("velocity 100");
+        let _ = self.host.send_command(ondeks_core::Command::SendMidi {
+            target: node_id,
+            event: MidiEvent::NoteOn {
+                channel,
+                note: pitch,
+                velocity,
+            },
+            sample_offset: 0,
+        });
+        self.pending_preview_offs.push((
+            Instant::now() + std::time::Duration::from_millis(250),
+            node_id,
+            pitch,
+        ));
+    }
+
+    /// Drain `pending_preview_offs` whose deadline has elapsed, sending
+    /// NoteOff commands to clear stuck preview voices.
+    fn drain_preview_offs(&mut self) {
+        if self.pending_preview_offs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let channel = Channel::new(0).expect("channel 0");
+        let mut still_pending: Vec<_> = Vec::with_capacity(self.pending_preview_offs.len());
+        for (deadline, node_id, pitch) in self.pending_preview_offs.drain(..) {
+            if now >= deadline {
+                let _ = self.host.send_command(ondeks_core::Command::SendMidi {
+                    target: node_id,
+                    event: MidiEvent::note_off(channel, pitch),
+                    sample_offset: 0,
+                });
+            } else {
+                still_pending.push((deadline, node_id, pitch));
+            }
+        }
+        self.pending_preview_offs = still_pending;
     }
 
     /// Render arrangement view (timeline).
@@ -1219,6 +1423,10 @@ impl eframe::App for OndeksApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Poll for runtime events
         self.poll_runtime_events();
+
+        // Send queued preview NoteOffs whose delay has elapsed (piano roll
+        // draws preview-fire the synth and need a NoteOff after ~250ms).
+        self.drain_preview_offs();
 
         // Intercept the OS-level close request (X button, Cmd+Q, etc.) so
         // dirty projects don't get silently lost. egui flips

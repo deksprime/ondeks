@@ -313,3 +313,87 @@ Ctrl+S / Ctrl+Shift+S / Ctrl+O / Ctrl+N save, save-as, open, and start a new pro
 - **Audio track clips not yet persisted** — `clip_from_data` currently rejects audio clips (`MalformedClip`). Slice 11 (load audio file → clip) will need to extend ClipData with pool-id / sample-path resolution and round-trip.
 - **Single project per app session** — Open / New replace the current project. Multi-window or tabbed projects aren't on the slice plan.
 - **Dirty flag is truthy after undo/redo** — even if undo brings the project back to its on-disk state, the flag stays dirty. Snapshot-comparison-based dirty tracking is more correct but a polish concern.
+
+### Post-landing fixes
+- **Stuck "S" key after dialog** — `rfd` blocks the UI thread; egui never sees the KeyUp for keys held during the dialog. Cleared `keys_down` post-dialog (centrally in `handle_file_shortcuts` and the close-request branch) so the QWERTY piano widget doesn't keep firing `S = D3`.
+- **Subsequent Ctrl+S looked broken** because no visible feedback: the silent direct save (after a path is set) succeeded but the user couldn't tell. Added a save status indicator to the toolbar — yellow `(modified)`, green `Saved just now → name`, gray `Unsaved`.
+- **Confirmation prompts for destructive ops** — replaced the original `confirm_discard_if_dirty` two-button dialog with an industry-standard three-button `What do you want to do?` prompt: `Save & X` / `Don't save & X` / `Continue working`. Wired into Ctrl+N, Ctrl+O, and OS-level window close (X button / Cmd+Q). Skipped when the project is clean.
+
+---
+
+## Slice 8: Piano Roll Editor
+
+- **Status:** Done (pending user verification)
+- **Started:** 2026-04-27
+- **Landed:** 2026-04-27
+- **Effort:** HIGH (as estimated)
+
+### Summary
+The biggest UI surface yet. Double-click an empty session slot on a MIDI track and a piano roll editor opens — actual note grid, piano keys label column, click-to-add, click-to-select, drag-to-move, drag-the-right-edge-to-resize, Delete to remove, Esc to deselect. Every edit is undoable. Notes round-trip through the JSON save format (Slice 7 storage extended with a `notes` field; older v1 files transparently load by lowering NoteOn/NoteOff pairs). Drawing a note briefly fires the track's instrument so you hear what you placed; a queued NoteOff clears it ~250 ms later, no stuck voices.
+
+### Files touched
+- **Edit:** `core/src/project/clip.rs` — new `MidiNote { time, length, pitch, velocity, channel }`. `MidiClip` grows a `notes: Vec<MidiNote>` field alongside the existing `sequence`. Notes are the editing surface; `sequence` keeps non-note events (control change, pitch bend, etc.) untouched.
+- **Edit:** `core/src/project/mod.rs` — re-export `MidiNote`.
+- **Edit:** `core/src/project/project.rs` — `Project::get_midi_clip_mut(ClipId)` convenience for piano-roll edits.
+- **Edit:** `core/src/persistence/format.rs` — `ClipData::notes: Option<Vec<NoteData>>` (additive, `#[serde(default)]`). New `NoteData { time, length, pitch, velocity, channel }`.
+- **Edit:** `core/src/persistence/serialize.rs` — emit `clip.notes` to `NoteData` alongside the (now non-note) `midi_events`.
+- **Edit:** `core/src/persistence/deserialize.rs` — prefer `notes` when present; fall back to `lower_sequence_to_notes()` which pairs NoteOn/NoteOff events from older v1 files. After lowering, note events are stripped from the legacy sequence so they don't double-count at playback.
+- **Edit:** `ui-common/src/commands/project.rs` — five new `ProjectCommand` variants: `AddMidiNote`, `RemoveMidiNote`, `RestoreMidiNote` (inverse carrier), `MoveMidiNote`, `ResizeMidiNote`, `SetNoteVelocity`.
+- **Edit:** `ui-common/src/dispatch.rs` — handle the five variants; each captures pre-state for undo (old time/pitch for Move, old length for Resize, old velocity for SetNoteVelocity, removed note for Remove). `RestoreMidiNote` exists as the undo of `RemoveMidiNote` and the redo of `AddMidiNote` (preserving exact note identity through undo/redo cycles).
+- **New:** `gui/src/views/piano_roll.rs` — `PianoRollView` widget. Layout: piano-key label column on the left, time ruler on top, note grid centered. Notes drawn as colored rectangles (orange when selected, blue otherwise). Pointer interactions: hit-test against existing notes (rightmost-first, so newer notes win); 5px right-edge zone triggers resize; drag without release tracks pointer; release commits via `commit_move` / `commit_resize`. Click on empty grid → `add_note` at snapped time / pitch. Snap fixed at 1/8 beat. Delete/Backspace → `delete_selected`; Esc deselects.
+- **Edit:** `gui/src/views/session.rs` — `SessionViewResponse::slot_double_clicked: Option<(usize, usize)>`. Slot interaction now distinguishes single click (selection) from double click (open clip).
+- **Edit:** `gui/src/views/mod.rs` — export piano roll types.
+- **Edit:** `gui/src/app.rs` — `CurrentView::PianoRoll { clip_id, track_id, scene_idx }` variant. New methods: `open_or_create_clip_in_slot` (creates a 4-beat MidiClip if the slot is empty, places it, switches view), `render_piano_roll` (snapshots clip notes and length, runs the view, dispatches commands per response), `preview_note` (sends `Command::SendMidi` NoteOn to the track's instrument and queues a NoteOff for ~250 ms later), `drain_preview_offs` (pulled each `update()` to send queued NoteOffs after their deadlines). Piano-roll fields on `OndeksApp`: `piano_roll_selected: Option<usize>`, `piano_roll_drag: DragState`, `pending_preview_offs: Vec<(Instant, NodeId, MidiPitch)>`.
+- **New:** `core/tests/slice8_piano_roll.rs` (gated on `serde`) — 4 tests: notes round-trip through serialize/deserialize, old v1 file with events-only loads via lowering, unmatched NoteOn gets default length, channel + velocity round-trip.
+- **New:** `ui-common/tests/slice8_piano_roll.rs` — 6 tests: AddMidiNote append / undo, AddMidiNote → undo → redo restores exact note, RemoveMidiNote undo restores at same index, MoveMidiNote undo restores time + pitch, ResizeMidiNote undo restores length, SetNoteVelocity undo restores value.
+
+### Invariants added / reinforced
+- **Notes are the editing surface.** `Vec<MidiNote>` is the indexed, stable data structure the piano roll mutates. Each note has a fixed index for the duration of an edit gesture (we add to the end, so existing indices don't shift on Add). Other commands (Move/Resize/SetVelocity) mutate in place — the index stays valid.
+- **Round-trip preserves exact note state.** Serialize → deserialize round-trips bit-for-bit on time, length, pitch, velocity, channel. `Vec<MidiNote>` ordering is preserved (we don't auto-sort by time on save/load).
+- **Backwards-compat by `#[serde(default)]`** — older v1 files without the `notes` field load cleanly: events are paired into notes via `lower_sequence_to_notes`. Unmatched NoteOns get a 0.25-beat default length so they're at least visible in the editor.
+- **Preview NoteOffs are guaranteed to fire.** Even if the user closes the piano roll, switches projects, or hits Ctrl+N mid-preview, `drain_preview_offs` runs every `update()` and emits the queued NoteOff. Stuck voices can't accumulate.
+
+### Test results
+- **372 tests pass**, zero failures (up from 362).
+- 4 new persistence round-trip tests in `core/tests/slice8_piano_roll.rs`.
+- 6 new dispatcher round-trip tests in `ui-common/tests/slice8_piano_roll.rs`.
+- All Slice 1-7 tests unchanged.
+
+### Surprises / lessons
+- **Borrow-checker dance during piano-roll rendering.** The widget needs `&self.notes` (immutable on the project) but the response handlers need `&mut self` to dispatch commands. Cleanest: snapshot `c.notes.clone()` and `c.header.length` at the top of `render_piano_roll`, drop the project borrow, then run the widget and dispatch. The clone is small (notes Vec is short-lived per render).
+- **Cross-crate test placement.** Dispatcher tests live in `ui-common/tests/` because `core` can't depend on `ui-common` (would be circular). Persistence-only tests stay in `core/tests/`. Two test files for one slice is fine; both are gated to clearly state what they cover.
+- **`MidiClip::header.length` not `.length()`** — `Clip::length()` exists, but on the wrapped `Clip` enum, not on `MidiClip` itself. Reach through the header. Minor confusing — easy to lose ten seconds finding it.
+- **Preview-on-draw is async-ish.** Need a queue of pending NoteOffs because we don't want to block the UI thread for 250 ms after every drawn note. egui's `update()` runs at ~60 fps, so checking the queue every frame is cheap.
+- **Drag-and-commit-on-release is the simplest interaction model.** First draft tried to dispatch MoveMidiNote during drag (every frame the cursor moved), but that floods history with intermediate values and the engine command queue too. Commit-on-release pattern: track `DragState` locally; emit one `MoveMidiNote` / `ResizeMidiNote` when the user releases the mouse. One undo entry per gesture. No visual feedback during drag in this MVP — note jumps to its new position on release. Ghost-rendering during drag is a polish slice.
+- **`SessionView::slot_double_clicked` distinct from `slot_clicked`** — egui delivers both events for a double-click (single click on first frame, double click on second). Our handler picks one: if double, treat as the open-clip action; otherwise as selection. Clicking an empty slot once → just selects; clicking twice → creates and opens.
+- **Audio tracks ignored.** `open_or_create_clip_in_slot` skips non-MIDI tracks because there's no audio editor yet. The slot still selects on click but nothing happens on double-click. Slice 11 (load audio file → clip) will introduce an audio clip editor; for now this is intentional.
+
+### Follow-ups
+- **Slice 9 (MIDI Clip Playback)** is next. The piano roll edits notes but they don't sound during transport. Slice 9 makes `ClipLauncher` real: launching a slot (▶ button) should walk the clip's notes and dispatch `Command::SendMidi` to the track's instrument at sample-accurate positions. The transport drives clip progression; loop is honored. After Slice 9, Ondeks is a real composing environment.
+- **Multi-select.** Drag a marquee across multiple notes → select them. Bulk delete / move. Polish slice.
+- **Velocity lane.** Bottom strip showing per-note velocity bars; drag to edit. Polish slice.
+- **Snap picker.** Currently 1/8 beat fixed. Add a dropdown for 1/4 / 1/8 / 1/16 / 1/32 + triplets. Cheap polish.
+- **Tool modes (Erase, Split).** The `EditTool` enum supports them but the widget is only Draw / Select today. Polish slice.
+- **Per-note context menu.** Right-click a note → Delete / Duplicate / Mute / Set velocity. Polish slice.
+- **Audio tracks don't get a clip editor yet** — Slice 11 introduces an audio clip view (waveform + warp markers).
+
+### Post-landing polish (same day, 2026-04-27)
+Five rounds of refinement after the initial drop, all in `gui/src/views/piano_roll.rs` + a few lines in `app.rs`:
+
+1. **Ghost rendering during drag.** Originally the widget committed-on-release with no visual feedback during drag — the note jumped to its new position only after release. Added a translucent yellow ghost at the proposed destination + dimmed the original note while held. Standard DAW UX.
+
+2. **Vertical drag was hijacked by `egui::ScrollArea`.** Drag-to-scroll was on by default and stole vertical drags inside scrollable content. One-line fix: `.drag_to_scroll(false)` on the scroll area. Vertical drag now changes pitch as intended.
+
+3. **Click-anchored, delta-based dragging.** Original implementation snapped the cursor's beat directly into the new note position — so clicking the *middle* of a long note made the note jump to align its start with the cursor. Switched to delta-based positioning: ghost = original position + (snapped pointer delta from click point). Click + hold + release without moving = no commit, no ghost (selection only). Move enough to register one snap unit / one semitone before the ghost appears.
+
+4. **Cursor icons on hover.**
+   - Note body → `Grab` (open hand).
+   - Note right-edge resize zone → `ResizeHorizontal` (↔).
+   - Active drag — body → `Grabbing`, edge → `ResizeHorizontal`.
+   - Keyboard strip → `PointingHand` (clickable hint).
+
+5. **Click-to-preview-pitch + drag-to-scrub.** Click any piano key on the left strip → that pitch fires through the armed track's instrument (one-shot 250 ms, same machinery as Slice 8's place-a-note preview). Click-and-hold + slide down the strip → glissando, each pitch crossing fires. While dragging a note vertically, every pitch row the cursor crosses fires too. Last-previewed pitch tracked in `DragState::last_previewed_pitch` so duplicate fires are suppressed; reset on mouse-up.
+
+6. **F-E divider in the keyboard column.** White-key adjacencies (B-C and F-E within each octave) had no visible separator on the left strip; F and E ran together visually. Added a 1-pixel gray(120) line under each F row, scoped to the keyboard column only (full-width B-C divider already serves as the octave marker).
+
+`PianoRollResponse` grew a `preview_pitch: Option<Note>` field; `DragState` grew `last_previewed_pitch`. `app.rs::render_piano_roll` forwards `response.preview_pitch` to `preview_note` (already implemented). No new tests — these are visual / interaction-only changes.

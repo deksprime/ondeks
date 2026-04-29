@@ -256,6 +256,15 @@ impl Project {
         self.clips.get_mut(&id)
     }
 
+    /// Get a mutable MIDI clip by ID, or `None` if absent or not a MIDI clip.
+    /// Convenience for piano-roll editing paths.
+    pub fn get_midi_clip_mut(&mut self, id: ClipId) -> Option<&mut crate::project::MidiClip> {
+        match self.clips.get_mut(&id)? {
+            Clip::Midi(midi) => Some(midi),
+            _ => None,
+        }
+    }
+
     /// Get all clips.
     pub fn clips(&self) -> impl Iterator<Item = &Clip> {
         self.clips.values()

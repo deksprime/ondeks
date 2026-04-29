@@ -5,8 +5,10 @@
 //! produces after capturing pre-mutation state, pushed into the undo stack.
 
 use ondeks_core::Command as EngineCommand;
-use ondeks_core::{TrackId, Color};
-use ondeks_core::project::{Track, TrackType};
+use ondeks_core::{ClipId, TrackId, Color};
+use ondeks_core::project::{MidiNote, Track, TrackType};
+use ondeks_core::transport::Beats;
+use ondeks_core::midi::{Note, Velocity};
 
 /// Commands for project management.
 #[derive(Debug, Clone)]
@@ -50,6 +52,54 @@ pub enum ProjectCommand {
     RemoveScene { index: usize },
     /// Rename a scene at the given index.
     RenameScene { index: usize, name: String },
+
+    // --- MIDI clip notes (Slice 8 piano roll) ---
+    /// Append a note to a MIDI clip. Stable index = position in the clip's
+    /// `notes` after insertion (the dispatcher captures it for undo).
+    AddMidiNote { clip_id: ClipId, note: MidiNote },
+    /// Remove a note at `note_index` in a clip.
+    RemoveMidiNote { clip_id: ClipId, note_index: usize },
+    /// Restore a note at a specific index. Used as the undo of
+    /// `RemoveMidiNote` (and as the redo of `AddMidiNote` after undo).
+    RestoreMidiNote {
+        /// Clip the note belongs to.
+        clip_id: ClipId,
+        /// Index to insert the note at.
+        note_index: usize,
+        /// The note data to restore.
+        note: MidiNote,
+    },
+    /// Move a note to a new (time, pitch). Resize is a separate command so
+    /// vertical drag (pitch) and horizontal drag (time) can be coalesced
+    /// later if needed.
+    MoveMidiNote {
+        /// Clip the note belongs to.
+        clip_id: ClipId,
+        /// Stable index of the note within the clip.
+        note_index: usize,
+        /// New start time.
+        new_time: Beats,
+        /// New pitch (0-127).
+        new_pitch: Note,
+    },
+    /// Set a note's length (resize).
+    ResizeMidiNote {
+        /// Clip the note belongs to.
+        clip_id: ClipId,
+        /// Stable index of the note within the clip.
+        note_index: usize,
+        /// New length in beats.
+        new_length: Beats,
+    },
+    /// Set a note's velocity.
+    SetNoteVelocity {
+        /// Clip the note belongs to.
+        clip_id: ClipId,
+        /// Stable index of the note within the clip.
+        note_index: usize,
+        /// New velocity (0-127).
+        new_velocity: Velocity,
+    },
 }
 
 impl ProjectCommand {
@@ -76,6 +126,12 @@ impl ProjectCommand {
             Self::AddScene { .. } => "Add Scene",
             Self::RemoveScene { .. } => "Remove Scene",
             Self::RenameScene { .. } => "Rename Scene",
+            Self::AddMidiNote { .. } => "Add Note",
+            Self::RemoveMidiNote { .. } => "Remove Note",
+            Self::RestoreMidiNote { .. } => "Restore Note",
+            Self::MoveMidiNote { .. } => "Move Note",
+            Self::ResizeMidiNote { .. } => "Resize Note",
+            Self::SetNoteVelocity { .. } => "Set Note Velocity",
         }
     }
 }
