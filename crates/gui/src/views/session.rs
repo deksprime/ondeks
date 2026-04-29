@@ -51,6 +51,10 @@ impl<'a> SessionView<'a> {
 pub struct SessionViewResponse {
     /// Slot that was clicked (track, scene)
     pub slot_clicked: Option<(usize, usize)>,
+    /// Slot that was double-clicked (track, scene). The session-view caller
+    /// uses this to open / create a MIDI clip in the slot and switch to the
+    /// piano roll.
+    pub slot_double_clicked: Option<(usize, usize)>,
     /// Scene launch button clicked
     pub scene_launched: Option<usize>,
     /// Track stop button clicked
@@ -278,7 +282,10 @@ impl<'a> SessionView<'a> {
                         if let Some(row) = self.vm.slots.get(scene_idx) {
                             for slot in row {
                                 let slot_response = self.draw_slot(ui, slot, slot_width, slot_height);
-                                if slot_response.clicked() {
+                                if slot_response.double_clicked() {
+                                    response.slot_double_clicked =
+                                        Some((slot.track_index, slot.scene_index));
+                                } else if slot_response.clicked() {
                                     response.slot_clicked = Some((slot.track_index, slot.scene_index));
                                 }
                             }

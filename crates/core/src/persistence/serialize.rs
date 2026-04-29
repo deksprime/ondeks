@@ -80,9 +80,25 @@ pub fn project_to_file(project: &Project) -> ProjectFile {
                     },
                     length: header.length.0,
                     midi_events: None,
+                    notes: None,
                 };
 
                 if let crate::project::Clip::Midi(midi_clip) = c {
+                    // Notes (primary editable surface).
+                    let notes: Vec<NoteData> = midi_clip
+                        .notes
+                        .iter()
+                        .map(|n| NoteData {
+                            time: n.time.0,
+                            length: n.length.0,
+                            pitch: n.pitch.raw(),
+                            velocity: n.velocity.raw(),
+                            channel: n.channel.raw(),
+                        })
+                        .collect();
+                    clip_data.notes = Some(notes);
+
+                    // Sequence events (control change / pitch bend / etc.).
                     let events: Vec<MidiEventData> = midi_clip
                         .sequence
                         .events()

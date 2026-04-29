@@ -10,13 +10,14 @@ use thiserror::Error;
 use crate::ids::{ClipId, NodeId, SceneId, TrackId};
 use crate::midi::{Channel, MidiEvent, MidiSequence, Note, TimestampedEvent, Velocity};
 use crate::project::{
-    ArrangementClip, Clip, MidiClip, Project, ProjectMeta, Scene, Track, TrackType,
+    ArrangementClip, Clip, MidiClip, MidiNote, Project, ProjectMeta, Scene, Track, TrackType,
 };
 use crate::transport::{Beats, TempoMap, TimeSignature};
 use crate::Color;
 
 use super::format::{
-    ArrangementClipData, ClipData, ColorData, MidiEventData, ProjectFile, SceneData, TrackData,
+    ArrangementClipData, ClipData, ColorData, MidiEventData, NoteData, ProjectFile, SceneData,
+    TrackData,
 };
 use super::migrate::{migrate_to_current, version_of, MigrateError};
 
@@ -183,19 +184,50 @@ fn color_from_data(data: &ColorData) -> Color {
 fn clip_from_data(data: &ClipData) -> Result<Clip, LoadError> {
     match data.clip_type.as_str() {
         "midi" => {
-            let events = data
-                .midi_events
-                .as_ref()
-                .ok_or(LoadError::MalformedClip(data.id, "midi clip missing events"))?;
             let mut clip = MidiClip::new(data.name.clone(), Beats(data.length));
             clip.header.id = ClipId::from_raw(data.id);
-            // Replace the default empty sequence with the loaded one.
+
+            // Sequence: parse the on-disk events. For files written by
+            // Slice 8+ this holds non-note events (CC, pitch bend, etc.); for
+            // older v1 files it holds NoteOn/NoteOff pairs that we'll lower
+            // into `notes` below if `notes` is absent.
             let mut sequence = MidiSequence::with_length(Beats(data.length));
-            for event in events {
-                let parsed = midi_event_from_data(event, data.id)?;
-                sequence.add_event(TimestampedEvent::new(Beats(event.time), parsed));
+            if let Some(events) = data.midi_events.as_ref() {
+                for event in events {
+                    let parsed = midi_event_from_data(event, data.id)?;
+                    sequence.add_event(TimestampedEvent::new(Beats(event.time), parsed));
+                }
             }
-            clip.sequence = sequence;
+
+            // Notes: prefer the explicit list when present (Slice 8+).
+            // Otherwise lower the sequence's NoteOn/NoteOff pairs into notes
+            // so older v1 files round-trip cleanly.
+            clip.notes = if let Some(notes) = data.notes.as_ref() {
+                notes
+                    .iter()
+                    .map(|n| note_from_data(n, data.id))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                lower_sequence_to_notes(&sequence, data.id)?
+            };
+
+            // After lowering, drop the note events from the legacy sequence
+            // so we don't double-count them at playback. Keep CC etc.
+            if data.notes.is_none() {
+                let mut compacted = MidiSequence::with_length(Beats(data.length));
+                for ev in sequence.events() {
+                    if !matches!(
+                        ev.event,
+                        MidiEvent::NoteOn { .. } | MidiEvent::NoteOff { .. }
+                    ) {
+                        compacted.add_event(ev.clone());
+                    }
+                }
+                clip.sequence = compacted;
+            } else {
+                clip.sequence = sequence;
+            }
+
             Ok(Clip::Midi(clip))
         }
         "audio" => Err(LoadError::MalformedClip(
@@ -204,6 +236,78 @@ fn clip_from_data(data: &ClipData) -> Result<Clip, LoadError> {
         )),
         other => Err(LoadError::UnknownClipType(other.to_string())),
     }
+}
+
+fn note_from_data(data: &NoteData, clip_id: u64) -> Result<MidiNote, LoadError> {
+    let bad = |reason: &str| LoadError::InvalidMidi {
+        clip_id,
+        detail: reason.to_string(),
+    };
+    Ok(MidiNote {
+        time: Beats(data.time),
+        length: Beats(data.length),
+        pitch: Note::new(data.pitch).map_err(|_| bad("invalid pitch"))?,
+        velocity: Velocity::new(data.velocity).map_err(|_| bad("invalid velocity"))?,
+        channel: Channel::new(data.channel).map_err(|_| bad("invalid channel"))?,
+    })
+}
+
+/// Pair `NoteOn` / `NoteOff` events in `sequence` into editable notes.
+/// Used as a fallback when loading older files that didn't persist the
+/// `notes` field directly. Pairing rule: each `NoteOn` is matched against
+/// the next `NoteOff` on the same channel + pitch; unmatched `NoteOn`s
+/// default to a length of 0.25 beats so they're at least visible in the
+/// piano roll. Stray `NoteOff`s are dropped.
+fn lower_sequence_to_notes(
+    sequence: &MidiSequence,
+    clip_id: u64,
+) -> Result<Vec<MidiNote>, LoadError> {
+    let bad = |reason: &str| LoadError::InvalidMidi {
+        clip_id,
+        detail: reason.to_string(),
+    };
+    let mut notes: Vec<MidiNote> = Vec::new();
+    let mut pending: Vec<usize> = Vec::new(); // indices into `notes` awaiting a NoteOff
+
+    for ev in sequence.events() {
+        match &ev.event {
+            MidiEvent::NoteOn { channel, note, velocity } => {
+                notes.push(MidiNote {
+                    time: ev.time,
+                    length: Beats(0.25),
+                    pitch: *note,
+                    velocity: *velocity,
+                    channel: *channel,
+                });
+                pending.push(notes.len() - 1);
+            }
+            MidiEvent::NoteOff { channel, note, .. } => {
+                // Find the most recent matching pending NoteOn.
+                let pos = pending.iter().rposition(|&idx| {
+                    notes[idx].channel == *channel && notes[idx].pitch == *note
+                });
+                if let Some(p) = pos {
+                    let idx = pending.remove(p);
+                    let length = ev.time.0 - notes[idx].time.0;
+                    if length > 0.0 {
+                        notes[idx].length = Beats(length);
+                    }
+                }
+                // Unmatched NoteOff is silently dropped — no Note Off without
+                // a Note On is meaningful in editable form.
+            }
+            _ => {}
+        }
+    }
+
+    // Validate that all surviving note indices are in range.
+    for note in &notes {
+        if note.length.0 < 0.0 {
+            return Err(bad("note has negative length after pairing"));
+        }
+    }
+
+    Ok(notes)
 }
 
 fn midi_event_from_data(data: &MidiEventData, clip_id: u64) -> Result<MidiEvent, LoadError> {

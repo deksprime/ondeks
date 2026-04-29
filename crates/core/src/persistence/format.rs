@@ -136,8 +136,31 @@ pub struct ClipData {
     pub clip_type: String,
     /// Clip length in beats.
     pub length: f64,
-    /// MIDI events (only for MIDI clips).
+    /// MIDI events (only for MIDI clips). Used for control change / pitch
+    /// bend / aftertouch on new files; older v1 files use this to encode
+    /// notes as `NoteOn`/`NoteOff` pairs which the loader lowers into the
+    /// `notes` field if `notes` is absent.
     pub midi_events: Option<Vec<MidiEventData>>,
+    /// Editable notes (Slice 8+). Optional so older files without it still
+    /// parse; loader prefers `notes` and falls back to lowering
+    /// `midi_events` pairs.
+    #[serde(default)]
+    pub notes: Option<Vec<NoteData>>,
+}
+
+/// One editable note in a MIDI clip.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct NoteData {
+    /// Start time in beats from the clip start.
+    pub time: f64,
+    /// Length in beats.
+    pub length: f64,
+    /// MIDI pitch (0-127).
+    pub pitch: u8,
+    /// Note-on velocity (0-127).
+    pub velocity: u8,
+    /// MIDI channel (0-15).
+    pub channel: u8,
 }
 
 /// MIDI event data for serialization.
