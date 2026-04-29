@@ -9,9 +9,12 @@ name = "ondeks"
 path = "src/main.rs"
 
 [dependencies]
-ondeks-core = { path = "../core" }
+ondeks-core = { path = "../core", features = ["serde"] }
 ondeks-runtime = { path = "../runtime" }
 ondeks-ui-common = { path = "../ui-common" }
+
+# Native file dialogs for project persistence (Save / Open / New).
+rfd = "0.14"
 
 # GUI framework
 eframe = "0.29"

@@ -1,9 +1,21 @@
 //! File format structures for project serialization.
+//!
+//! Versioning: every persisted file carries `version: u32`. The framework in
+//! [`migrate`](super::migrate) chains migrations from older versions up to
+//! [`CURRENT_FORMAT_VERSION`]. Adding a new field that's optional in the
+//! existing version stays at the current version; removing or renaming
+//! fields, or adding required fields, bumps the version and adds a migration.
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-/// Current format version.
-pub const FORMAT_VERSION: u32 = 1;
+/// The current format version. Bump on every breaking change and add a
+/// migration in `persistence::migrate`.
+pub const CURRENT_FORMAT_VERSION: u32 = 1;
+
+/// Backwards-compatible alias for the old name. New code should reference
+/// [`CURRENT_FORMAT_VERSION`].
+#[deprecated(since = "0.2.0", note = "use CURRENT_FORMAT_VERSION")]
+pub const FORMAT_VERSION: u32 = CURRENT_FORMAT_VERSION;
 
 /// Top-level project file structure.
 #[derive(Debug, Serialize, Deserialize)]
@@ -20,6 +32,10 @@ pub struct ProjectFile {
     pub tracks: Vec<TrackData>,
     /// All clips in the project.
     pub clips: Vec<ClipData>,
+    /// Scenes (session view rows). Optional for forward-compat with older
+    /// files that didn't persist scenes; defaults to a single "Scene 1".
+    #[serde(default)]
+    pub scenes: Vec<SceneData>,
 }
 
 /// Project metadata.
@@ -31,14 +47,37 @@ pub struct ProjectMetaData {
     pub author: String,
 }
 
+/// Color used for UI display (RGB, 0-255 each).
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+pub struct ColorData {
+    /// Red component.
+    pub r: u8,
+    /// Green component.
+    pub g: u8,
+    /// Blue component.
+    pub b: u8,
+}
+
+/// Scene metadata.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SceneData {
+    /// Scene id.
+    pub id: u64,
+    /// Display name.
+    pub name: String,
+    /// Optional tempo override.
+    #[serde(default)]
+    pub tempo: Option<f64>,
+}
+
 /// Track data for serialization.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TrackData {
-    /// Track ID.
+    /// Track id.
     pub id: u64,
     /// Track name.
     pub name: String,
-    /// Track type as string.
+    /// Track type as string ("Audio", "Midi", "Group", "Return", "Master").
     pub track_type: String,
     /// Volume in dB.
     pub volume_db: f32,
@@ -46,6 +85,31 @@ pub struct TrackData {
     pub pan: f32,
     /// Whether the track is muted.
     pub muted: bool,
+    /// Whether the track is soloed.
+    #[serde(default)]
+    pub soloed: bool,
+    /// Whether the track is armed for recording / live MIDI input.
+    #[serde(default)]
+    pub armed: bool,
+    /// Display color (RGB). Default gray for older files.
+    #[serde(default)]
+    pub color: ColorData,
+    /// Instrument node id (MIDI tracks only). `None` for non-MIDI.
+    #[serde(default)]
+    pub instrument: Option<u64>,
+    /// Channel-strip node id (MIDI tracks only). `None` for non-MIDI.
+    #[serde(default)]
+    pub channel_strip: Option<u64>,
+    /// Session slots (one entry per scene). `None` = empty slot,
+    /// `Some(clip_id)` = clip placed in that slot.
+    #[serde(default)]
+    pub session_slots: Vec<Option<u64>>,
+    /// Send levels keyed by destination track id. Empty for older files.
+    #[serde(default)]
+    pub sends: std::collections::HashMap<u64, f32>,
+    /// Parent group track id, if any.
+    #[serde(default)]
+    pub parent: Option<u64>,
     /// Clips placed on the arrangement timeline.
     pub arrangement_clips: Vec<ArrangementClipData>,
 }
@@ -53,7 +117,7 @@ pub struct TrackData {
 /// Arrangement clip data.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ArrangementClipData {
-    /// Clip ID.
+    /// Clip id.
     pub clip_id: u64,
     /// Position in beats.
     pub position: f64,
@@ -64,7 +128,7 @@ pub struct ArrangementClipData {
 /// Clip data for serialization.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClipData {
-    /// Clip ID.
+    /// Clip id.
     pub id: u64,
     /// Clip name.
     pub name: String,

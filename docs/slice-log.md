@@ -263,3 +263,53 @@ Volume faders, pan, mute, solo, and master fader actually affect audio. Each MID
 - **Per-track meters** — strip nodes don't yet emit their own meter readings. The runtime master meter still works via `Host`'s post-output peak, but per-strip metering is a separate slice.
 - **No master mute or solo** — master strip only has a gain. Adding a mute on the master is trivial if needed.
 - **Pan law is constant-power.** For mono → stereo this is canonical; if Slice 11+ introduces stereo-input audio tracks, we'll need a "balance" pan (cuts opposite channel) vs. "true pan" (Haas-style) decision.
+
+---
+
+## Slice 7: Save & Load Projects
+
+- **Status:** Done (pending user verification)
+- **Started:** 2026-04-26
+- **Landed:** 2026-04-26
+- **Effort:** MEDIUM (as estimated)
+
+### Summary
+Ctrl+S / Ctrl+Shift+S / Ctrl+O / Ctrl+N save, save-as, open, and start a new project via native file dialogs (`rfd`). Project state — tracks, mixer values, instrument & strip node ids, scenes, colors, arm/solo/mute — round-trips through JSON. The persistence file carries `version: u32` and a migration framework lives next to it (P0.3 from day 1, even though the table is empty at v1). On load, the engine graph tears down old instrument channels and rebuilds the new project's graph, including per-track volume / pan / mute / solo and the master fader. Window title shows `*` while there are unsaved changes; clears on save.
+
+### Files touched
+- **Edit:** `core/src/persistence/format.rs` — `TrackData` expanded with all Slice 4-6 state (color, soloed, armed, instrument & channel_strip node ids, session_slots, sends, parent). New `SceneData` and `scenes` field on `ProjectFile`. New fields use `#[serde(default)]` so older files still parse. `CURRENT_FORMAT_VERSION` is the canonical name; `FORMAT_VERSION` kept as a `#[deprecated]` alias for the existing phase13 tests.
+- **New:** `core/src/persistence/migrate.rs` — `migrate_to_current(value, from)` walks migrations from `from` up to `CURRENT_FORMAT_VERSION`. Empty migration table today; framework lets v2 land without rewriting load code. `MigrateError` covers missing version, future version, unknown step, and decode failure.
+- **New:** `core/src/persistence/deserialize.rs` — `project_from_json(json)` and `file_to_project(file)`. Reconstructs `Track` with all fields (TrackId/NodeId/ClipId via `from_raw`); replaces auto-generated default scenes/master via new `Project::replace_scenes` / `replace_tracks` helpers. `LoadError` enum surfaces every failure mode (bad JSON, migration error, unknown track/clip type, invalid MIDI, missing required fields, project structure invariant violation).
+- **Rewrite:** `core/src/persistence/serialize.rs` — emits the expanded `TrackData` plus scenes. Refactored MIDI-event-to-data into a `midi_event_to_data` helper.
+- **Edit:** `core/src/project/project.rs` — `replace_scenes`, `replace_tracks` (validates exactly one master track exists), used by the loader.
+- **Edit:** `core/src/persistence/mod.rs` — exports.
+- **Edit:** `gui/Cargo.toml` — `ondeks-core` now opts into `features = ["serde"]`; added `rfd = "0.14"` for native file dialogs.
+- **Edit:** `gui/src/app.rs` — `project_path: Option<PathBuf>`, `is_dirty: bool`, `mark_dirty` called from every state-mutation path (`dispatch_project_command`, `apply_strip_action`, `set_master_volume`, `apply_ui_command_replay`). New helpers: `replace_project` (graph teardown + rebuild + history reset), `save_project`, `open_project_dialog`, `open_project_path`, `new_project`, `handle_file_shortcuts`. Window title rendered each frame via `ViewportCommand::Title`.
+- **New:** `core/tests/slice7_persistence.rs` — 8 integration tests (gated on `serde` feature): full round-trip preserves track state / master volume / scenes / track order, empty project round-trips, version probe reads current, future version errors, malformed JSON errors, unknown track type errors.
+
+### Invariants added / reinforced
+- **P0.3 versioning operational** — every persisted file has `version: u32`. Migration framework chains version-to-version transformations; future bumps add a step rather than rewriting the load path.
+- **Forward-compat via `#[serde(default)]`** — newly-added fields (color, instrument id, channel_strip id, soloed, armed, scenes, sends, parent) all have defaults so older v1 files without them still parse cleanly.
+- **Graph identity round-trips** — `instrument` and `channel_strip` `NodeId`s persist, so saving + loading produces the exact same graph topology. Loaded MIDI tracks that *predate* the channel_strip field get a fresh strip id at load time so the engine still wires them up.
+- **Dirty tracking is total** — every mutation path calls `mark_dirty`, including undo/redo replay (after Ctrl+Z, the project is dirty against the save point).
+
+### Test results
+- **362 tests pass**, zero failures (up from 349).
+- 8 new persistence tests covering happy path + error paths.
+- All Slice 1-6 tests unchanged.
+
+### Surprises / lessons
+- **The pre-existing serializer was incomplete.** It only emitted `id, name, track_type, volume_db, pan, muted, arrangement_clips`. After Slices 4-6 the `Track` struct grew significantly (color, NodeIds, soloed, armed, etc.). Forward-compat via `#[serde(default)]` keeps old files loading cleanly while fixing the data loss for new files.
+- **`Project::new` always seeds a master track + Scene 1.** The deserializer can't just push loaded tracks/scenes — it has to *replace* the seed. Hence the `replace_tracks`/`replace_scenes` helpers that validate "exactly one master" and "at least one scene" invariants on the way in.
+- **`#[deprecated]` on a `pub const`** is the right way to keep the old `FORMAT_VERSION` name working for existing tests without committing to it forever. New code uses `CURRENT_FORMAT_VERSION`.
+- **`rfd` pulls in `ashpd` on Linux**, which has a future-incompat warning today (one transitive dep). Not blocking; will resolve when `ashpd` updates.
+- **Ctrl+S vs. egui's pre-existing TextEdit shortcuts** — TextEdit doesn't grab Ctrl+S, so no conflict. But our explicit event-queue scan still beats `consume_shortcut` for the same modifier-subset reason as Slice 4's undo.
+- **`replace_project` ordering matters** — emit `RemoveInstrumentChannel` for the OLD project's tracks BEFORE swapping `self.project`, otherwise we'd be reading the new tracks. After the swap, emit `AddInstrumentChannel` + per-track mixer state for each MIDI track in the new project, then `SetMasterVolume` from the master track. History gets cleared (loaded state shouldn't be undoable to before-load).
+
+### Follow-ups
+- **Slice 8 (Piano Roll)** is next. Double-click an empty session slot → MIDI clip → roll editor. Note draw/move/resize/velocity, undoable per-edit. Audio track persistence (currently rejected by the loader) lands with Slice 11.
+- **No prompt-on-dirty** for Ctrl+N / Ctrl+O / window close. If the user has unsaved work, current behavior silently wipes it. Polish slice or a confirmation modal needed.
+- **`rfd::FileDialog` is sync and blocks the UI thread** while a dialog is open. egui repaints freeze for the duration. Async dialogs (rfd's async API) would fix this but add complexity; acceptable for MVP.
+- **Audio track clips not yet persisted** — `clip_from_data` currently rejects audio clips (`MalformedClip`). Slice 11 (load audio file → clip) will need to extend ClipData with pool-id / sample-path resolution and round-trip.
+- **Single project per app session** — Open / New replace the current project. Multi-window or tabbed projects aren't on the slice plan.
+- **Dirty flag is truthy after undo/redo** — even if undo brings the project back to its on-disk state, the flag stays dirty. Snapshot-comparison-based dirty tracking is more correct but a polish concern.
