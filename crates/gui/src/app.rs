@@ -1,5 +1,8 @@
 //! Main application state and update loop.
 
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
 use eframe::egui;
 use ondeks_runtime::Host;
 use ondeks_ui_common::{
@@ -9,6 +12,7 @@ use ondeks_ui_common::{
     commands::ProjectCommand,
 };
 use ondeks_core::TrackId;
+use ondeks_core::persistence::{project_from_json, project_to_json};
 use ondeks_core::project::{Project, TrackType};
 use ondeks_core::session::SlotState;
 use ondeks_core::transport::Transport;
@@ -54,6 +58,17 @@ pub struct OndeksApp {
     /// session view renders a TextEdit on this track; on commit or cancel the
     /// app dispatches a `RenameTrack` and clears the buffer.
     rename_buffer: Option<(TrackId, String)>,
+
+    /// Filesystem path the project was last saved to / loaded from.
+    /// `None` means it has never been saved (next Ctrl+S triggers Save As).
+    project_path: Option<PathBuf>,
+    /// True if the project has unsaved changes since the last save / load.
+    /// Window title shows `*` while dirty.
+    is_dirty: bool,
+    /// Wall-clock instant of the last successful save. Drives the toolbar's
+    /// "Saved Xs ago" indicator so silent saves (Ctrl+S after a path is set)
+    /// give visible feedback.
+    last_save_at: Option<Instant>,
 }
 
 impl OndeksApp {
@@ -102,6 +117,60 @@ impl OndeksApp {
             show_inspector: true,
             show_keyboard: true,
             rename_buffer: None,
+            project_path: None,
+            is_dirty: false,
+            last_save_at: None,
+        }
+    }
+
+    /// Mark the project as having unsaved changes. Called from every
+    /// state-mutating path (project dispatcher, mixer actions, undo/redo
+    /// replay).
+    fn mark_dirty(&mut self) {
+        self.is_dirty = true;
+    }
+
+    /// Compose the window title: `* Project — Ondeks` when dirty, no `*` clean.
+    fn window_title(&self) -> String {
+        let prefix = if self.is_dirty { "* " } else { "" };
+        let name = if self.project.meta.name.is_empty() {
+            "Untitled"
+        } else {
+            self.project.meta.name.as_str()
+        };
+        format!("{prefix}{name} — Ondeks")
+    }
+
+    /// Human-readable save status for the toolbar. None when the project has
+    /// no path AND has never been saved (caller renders "Unsaved").
+    fn save_status_string(&self) -> Option<String> {
+        // Strip extension off the filename for compactness.
+        let path_label = self.project_path.as_ref().map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| {
+                    p.to_str().unwrap_or("project")
+                })
+                .to_string()
+        });
+        let saved_age = self.last_save_at.map(|t| {
+            let secs = t.elapsed().as_secs();
+            if secs < 5 {
+                "just now".to_string()
+            } else if secs < 60 {
+                format!("{}s ago", secs)
+            } else if secs < 3600 {
+                format!("{}m ago", secs / 60)
+            } else {
+                format!("{}h ago", secs / 3600)
+            }
+        });
+
+        match (path_label, saved_age, self.is_dirty) {
+            (Some(p), Some(age), false) => Some(format!("Saved {age} → {p}")),
+            (Some(p), Some(age), true) => Some(format!("Saved {age} → {p} (modified)")),
+            (Some(p), None, _) => Some(format!("Loaded → {p}")),
+            (None, _, _) => None,
         }
     }
 
@@ -165,6 +234,7 @@ impl OndeksApp {
                     });
                 }
                 self.rebuild_view_models();
+                self.mark_dirty();
             }
             Err(e) => tracing::warn!("project dispatch failed ({description}): {e}"),
         }
@@ -185,6 +255,7 @@ impl OndeksApp {
                     Err(e) => tracing::warn!("undo/redo replay failed: {e}"),
                 }
                 self.rebuild_view_models();
+                self.mark_dirty();
             }
             _ => {
                 // Other UI command families aren't routed through the project
@@ -352,6 +423,26 @@ impl OndeksApp {
                     .small()
                     .color(egui::Color32::from_gray(140)),
                 ),
+            );
+
+            // Save status indicator. Confirms that silent saves
+            // (Ctrl+S after a path is set) actually happened.
+            ui.separator();
+            let save_text = match self.save_status_string() {
+                Some(s) => s,
+                None => "Unsaved".to_string(),
+            };
+            let save_color = if self.is_dirty {
+                egui::Color32::from_rgb(255, 193, 7)
+            } else if self.last_save_at.is_some() {
+                egui::Color32::from_rgb(120, 200, 120)
+            } else {
+                egui::Color32::from_gray(140)
+            };
+            ui.label(
+                egui::RichText::new(save_text)
+                    .small()
+                    .color(save_color),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -802,6 +893,7 @@ impl OndeksApp {
             }
         }
         self.rebuild_view_models();
+        self.mark_dirty();
     }
 
     fn set_master_volume(&mut self, volume_db: f32) {
@@ -810,6 +902,295 @@ impl OndeksApp {
             .host
             .send_command(ondeks_core::Command::SetMasterVolume { volume_db });
         self.rebuild_view_models();
+        self.mark_dirty();
+    }
+
+    /// Replace the current project with a new one. Tears down the engine
+    /// graph for the old project's instrument channels and rebuilds it from
+    /// the new project (per-track AddInstrumentChannel + mixer state +
+    /// master volume). Clears history and saves the path so subsequent saves
+    /// don't prompt.
+    fn replace_project(&mut self, new_project: Project, path: Option<PathBuf>) {
+        // Tear down old graph: emit RemoveInstrumentChannel for every
+        // existing MIDI track that has both ids.
+        for track in self.project.tracks() {
+            if let (Some(synth), Some(strip)) = (track.instrument, track.channel_strip) {
+                let _ = self
+                    .host
+                    .send_command(ondeks_core::Command::RemoveInstrumentChannel {
+                        synth_node_id: synth,
+                        strip_node_id: strip,
+                    });
+            }
+        }
+
+        // Swap the project before iterating new tracks (we need it owned).
+        self.project = new_project;
+        self.project_path = path;
+        self.is_dirty = false;
+        self.last_save_at = None;
+        self.history = History::new(100);
+        self.rename_buffer = None;
+
+        // Build up new graph.
+        for track in self.project.tracks() {
+            if let (Some(synth), Some(strip)) = (track.instrument, track.channel_strip) {
+                let _ = self
+                    .host
+                    .send_command(ondeks_core::Command::AddInstrumentChannel {
+                        synth_node_id: synth,
+                        strip_node_id: strip,
+                        track_id: track.id,
+                    });
+                let _ = self.host.send_command(ondeks_core::Command::SetTrackVolume {
+                    node_id: strip,
+                    volume_db: track.volume_db,
+                });
+                let _ = self.host.send_command(ondeks_core::Command::SetTrackPan {
+                    node_id: strip,
+                    pan: track.pan,
+                });
+                let _ = self.host.send_command(ondeks_core::Command::SetTrackMute {
+                    node_id: strip,
+                    muted: track.muted,
+                });
+                let _ = self.host.send_command(ondeks_core::Command::SetTrackSolo {
+                    node_id: strip,
+                    soloed: track.soloed,
+                });
+            }
+        }
+        // Master volume: read from the master track.
+        let master_db = self.project.master().volume_db;
+        let _ = self
+            .host
+            .send_command(ondeks_core::Command::SetMasterVolume {
+                volume_db: master_db,
+            });
+
+        self.rebuild_view_models();
+    }
+
+    /// Save the project to disk. If `path_override` is `Some`, save there and
+    /// remember it as the new project_path; otherwise save to the existing
+    /// path or open a Save As dialog if there isn't one.
+    fn save_project(&mut self, path_override: Option<PathBuf>) {
+        let target = path_override.or_else(|| self.project_path.clone()).or_else(|| {
+            rfd::FileDialog::new()
+                .add_filter("Ondeks Project", &["odk", "json"])
+                .set_file_name(format!("{}.odk", self.project.meta.name))
+                .save_file()
+        });
+        let Some(target) = target else {
+            return; // user cancelled
+        };
+
+        match project_to_json(&self.project) {
+            Ok(json) => match std::fs::write(&target, json) {
+                Ok(()) => {
+                    self.project_path = Some(target.clone());
+                    self.is_dirty = false;
+                    self.last_save_at = Some(Instant::now());
+                    tracing::info!("saved project to {}", target.display());
+                }
+                Err(e) => tracing::error!("write failed for {}: {e}", target.display()),
+            },
+            Err(e) => tracing::error!("project_to_json failed: {e}"),
+        }
+    }
+
+    /// Open a project from disk via a file dialog.
+    fn open_project_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Ondeks Project", &["odk", "json"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.open_project_path(&path);
+    }
+
+    /// Open a project file at a known path. Reports failures via tracing
+    /// rather than crashing the app.
+    fn open_project_path(&mut self, path: &Path) {
+        let json = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("read failed for {}: {e}", path.display());
+                return;
+            }
+        };
+        match project_from_json(&json) {
+            Ok(project) => {
+                tracing::info!("loaded project from {}", path.display());
+                self.replace_project(project, Some(path.to_path_buf()));
+            }
+            Err(e) => tracing::error!("parse failed for {}: {e}", path.display()),
+        }
+    }
+
+    /// Replace the project with a fresh empty one (Ctrl+N).
+    fn new_project(&mut self) {
+        let project = Project::new("New Project");
+        self.replace_project(project, None);
+    }
+
+    /// Three-button "What do you want to do?" prompt for destructive actions
+    /// when the project has unsaved changes. Returns the user's choice; the
+    /// caller dispatches.
+    ///
+    /// Skipped (returns `Discard`) when the project is clean — common UX
+    /// pattern: no friction when there's nothing to save.
+    ///
+    /// `action_label` is the short verb shown on the action buttons
+    /// ("New", "Open", "Quit"). Same UI-thread-blocking gotcha as the file
+    /// dialogs — keys held during the dialog don't get their KeyUp delivered,
+    /// so callers should reset `keys_down` afterward.
+    fn ask_save_choice(&self, action_label: &str) -> SaveChoice {
+        if !self.is_dirty {
+            return SaveChoice::Discard;
+        }
+        let project_label = if self.project.meta.name.is_empty() {
+            "this project".to_string()
+        } else {
+            format!("\"{}\"", self.project.meta.name)
+        };
+
+        let result = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Info)
+            .set_title("What do you want to do?")
+            .set_description(&format!(
+                "{project_label} has unsaved edits."
+            ))
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                format!("Save & {action_label}"),
+                format!("Don't save & {action_label}"),
+                "Continue working".to_string(),
+            ))
+            .show();
+
+        // rfd's YesNoCancelCustom returns `Yes`/`No`/`Cancel` on most
+        // platforms but on some (e.g. xdg-portal flavors) it returns
+        // `Custom(label)`. Handle both shapes.
+        match result {
+            rfd::MessageDialogResult::Yes => SaveChoice::SaveFirst,
+            rfd::MessageDialogResult::No => SaveChoice::Discard,
+            rfd::MessageDialogResult::Cancel => SaveChoice::Cancel,
+            rfd::MessageDialogResult::Custom(label) => {
+                if label.starts_with("Save &") {
+                    SaveChoice::SaveFirst
+                } else if label.starts_with("Don't save") {
+                    SaveChoice::Discard
+                } else {
+                    SaveChoice::Cancel
+                }
+            }
+            _ => SaveChoice::Cancel,
+        }
+    }
+
+    /// Run a destructive action with the save-choice prompt in front of it.
+    /// `action_label` is what shows on the buttons; `action` is what runs
+    /// after Save (if save succeeded) or Discard.
+    fn with_save_choice(&mut self, action_label: &str, action: impl FnOnce(&mut Self)) {
+        match self.ask_save_choice(action_label) {
+            SaveChoice::SaveFirst => {
+                self.save_project(None);
+                // Save succeeded only if `is_dirty` flipped to false. If the
+                // user cancelled the Save As dialog mid-save, dirty stays
+                // true and we abort the destructive action.
+                if !self.is_dirty {
+                    action(self);
+                }
+            }
+            SaveChoice::Discard => action(self),
+            SaveChoice::Cancel => {}
+        }
+    }
+
+    /// Handle Ctrl+S / Ctrl+Shift+S / Ctrl+O / Ctrl+N file shortcuts using
+    /// the same explicit event-queue scan as undo/redo (avoids egui's loose
+    /// modifier matching swallowing the wrong shortcut).
+    fn handle_file_shortcuts(&mut self, ctx: &egui::Context) {
+        #[derive(Default)]
+        struct Picked {
+            save: bool,
+            save_as: bool,
+            open: bool,
+            new: bool,
+        }
+        let picked = ctx.input_mut(|i| {
+            let mut picked = Picked::default();
+            i.events.retain(|event| {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    let cmd = modifiers.command || modifiers.ctrl;
+                    let shift = modifiers.shift;
+                    let alt = modifiers.alt;
+                    if cmd && !alt {
+                        match (*key, shift) {
+                            (egui::Key::S, false) => {
+                                picked.save = true;
+                                return false;
+                            }
+                            (egui::Key::S, true) => {
+                                picked.save_as = true;
+                                return false;
+                            }
+                            (egui::Key::O, false) => {
+                                picked.open = true;
+                                return false;
+                            }
+                            (egui::Key::N, false) => {
+                                picked.new = true;
+                                return false;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                true
+            });
+            picked
+        });
+
+        let did_action = picked.save || picked.save_as || picked.open || picked.new;
+
+        if picked.save {
+            self.save_project(None);
+        }
+        if picked.save_as {
+            // Force re-prompt by clearing project_path before save.
+            let prior = self.project_path.take();
+            self.save_project(None);
+            // If user cancelled, restore prior path so a subsequent Ctrl+S
+            // still has a target.
+            if self.project_path.is_none() {
+                self.project_path = prior;
+            }
+        }
+        if picked.open {
+            self.with_save_choice("Open", |app| app.open_project_dialog());
+        }
+        if picked.new {
+            self.with_save_choice("New", |app| app.new_project());
+        }
+
+        // Native file dialogs (rfd) block the UI thread on Linux/X11 and
+        // Windows. While the dialog is up, egui never sees the KeyUp events
+        // for the keys the user was holding (Ctrl, S, etc.) — so on return
+        // egui still thinks those keys are pressed. The QWERTY piano keyboard
+        // widget reads `key_down` and would keep firing notes; the
+        // shortcut handler can also misbehave. Clearing `keys_down` post-
+        // action gives us a clean slate; the next real KeyDown re-populates.
+        if did_action {
+            ctx.input_mut(|i| i.keys_down.clear());
+        }
     }
 }
 
@@ -822,13 +1203,57 @@ enum StripActionKind {
     ToggleSolo,
 }
 
+/// What the user picked when prompted about unsaved changes before a
+/// destructive op (New / Open / Quit). Returned by `ask_save_choice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveChoice {
+    /// Save first, then perform the destructive action.
+    SaveFirst,
+    /// Drop the unsaved edits and perform the destructive action.
+    Discard,
+    /// Abort the destructive action; keep working in the current project.
+    Cancel,
+}
+
 impl eframe::App for OndeksApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Poll for runtime events
         self.poll_runtime_events();
 
+        // Intercept the OS-level close request (X button, Cmd+Q, etc.) so
+        // dirty projects don't get silently lost. egui flips
+        // `close_requested` for one frame; we either let it proceed or send
+        // CancelClose to keep the window alive.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            match self.ask_save_choice("Quit") {
+                SaveChoice::SaveFirst => {
+                    self.save_project(None);
+                    // If the user cancelled the Save As dialog mid-save,
+                    // dirty stays true → abort the close.
+                    if self.is_dirty {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    }
+                }
+                SaveChoice::Discard => {
+                    // Let the close proceed.
+                }
+                SaveChoice::Cancel => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+            }
+            // After a confirmation dialog, keys held during the prompt won't
+            // get their KeyUp delivered. Reset for consistency with the file
+            // shortcut path.
+            ctx.input_mut(|i| i.keys_down.clear());
+        }
+
+        // File ops first so saving doesn't fight with undo on Ctrl+S timing.
+        self.handle_file_shortcuts(ctx);
         // Undo / redo shortcuts
         self.handle_undo_redo_shortcuts(ctx);
+
+        // Window title reflects dirty state and project name.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
 
         // Request continuous repaints for meters and transport updates
         // Use a reasonable frame rate (60fps) instead of continuous

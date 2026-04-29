@@ -147,6 +147,38 @@ impl Project {
         self.tracks.iter().position(|t| t.id == id)
     }
 
+    /// Replace the entire scene list (used by the persistence loader).
+    /// Master scene "Scene 1" is appended automatically if `scenes` is empty
+    /// so the project always has at least one row.
+    pub fn replace_scenes(&mut self, mut scenes: Vec<Scene>) {
+        if scenes.is_empty() {
+            scenes.push(Scene::new("Scene 1"));
+        }
+        self.scenes = scenes;
+    }
+
+    /// Replace the entire track list (used by the persistence loader).
+    ///
+    /// Picks up the master track from the loaded list (must be present) and
+    /// updates `master_id` so master accessors keep working. Errors if no
+    /// master is present or if multiple masters are.
+    pub fn replace_tracks(&mut self, tracks: Vec<Track>) -> Result<(), ProjectError> {
+        let master_count = tracks
+            .iter()
+            .filter(|t| t.track_type == TrackType::Master)
+            .count();
+        if master_count != 1 {
+            return Err(ProjectError::CannotRemoveMaster);
+        }
+        let master = tracks
+            .iter()
+            .find(|t| t.track_type == TrackType::Master)
+            .expect("master track present");
+        self.master_id = master.id;
+        self.tracks = tracks;
+        Ok(())
+    }
+
     /// Arm a single track exclusively, disarming all others. Returns the
     /// previously-armed track id (if any) so callers that care about undo can
     /// remember it; arm is intentionally non-undoable though — it's an
