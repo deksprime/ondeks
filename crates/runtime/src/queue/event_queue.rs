@@ -2,6 +2,7 @@
 
 use crossbeam_channel::{bounded, Sender, Receiver};
 use ondeks_core::Event;
+use ondeks_core::session::SlotState;
 use ondeks_core::transport::BarBeatTick;
 
 /// Events emitted by the audio engine.
@@ -14,13 +15,23 @@ pub enum RuntimeEvent {
     /// Meter update (for UI VU meters).
     MeterUpdate { left: f32, right: f32 },
     /// Position update (sent periodically, not every buffer).
-    PositionUpdate { 
-        samples: u64, 
+    PositionUpdate {
+        samples: u64,
         beats: f64,
         bbt: BarBeatTick,
     },
     /// Transport state changed.
     TransportStateChanged { is_playing: bool },
+    /// Session-grid slot transitioned to a new state. Emitted when the engine
+    /// drains its launcher's pending state changes after each block.
+    SlotStateChanged {
+        /// Track index (master excluded).
+        track: usize,
+        /// Scene index.
+        scene: usize,
+        /// New slot state.
+        state: SlotState,
+    },
 }
 
 /// Queue for receiving events from the audio thread.

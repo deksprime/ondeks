@@ -2,6 +2,7 @@
 
 use crate::ids::{NodeId, TrackId};
 use crate::midi::MidiEvent;
+use crate::session::{ClipPlayback, LaunchQuantize};
 
 /// Commands that control the audio engine.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,4 +86,37 @@ pub enum Command {
         /// New target master volume in dB.
         volume_db: f32,
     },
+
+    /// Launch a session clip.
+    ///
+    /// The UI snapshots the clip's notes + the track's instrument node id into
+    /// `playback` before sending — the engine never reaches into `Project`. The
+    /// launcher quantizes the start to the next bar by default; the clip then
+    /// loops at `playback.length_beats` until stopped or replaced.
+    LaunchClip {
+        /// Track index in the session grid (0-based, master excluded).
+        track: usize,
+        /// Scene index in the session grid (0-based).
+        scene: usize,
+        /// Snapshot of the clip prepared for engine playback.
+        playback: ClipPlayback,
+    },
+    /// Stop every clip on a single track. Drains hanging notes.
+    StopTrack {
+        /// Track index in the session grid.
+        track: usize,
+    },
+    /// Launch every non-empty slot in a scene at the next quantize boundary.
+    /// `playbacks` carries one snapshot per non-empty slot.
+    LaunchScene {
+        /// Scene index.
+        scene: usize,
+        /// `(track, ClipPlayback)` for every slot to launch.
+        playbacks: Vec<(usize, ClipPlayback)>,
+    },
+    /// Stop every playing or queued clip across the session grid.
+    StopAll,
+    /// Set the launcher's quantize mode. Tests use `LaunchQuantize::None` to
+    /// fire clips immediately; the UI keeps it on `Bar` by default.
+    SetLaunchQuantize(LaunchQuantize),
 }

@@ -55,6 +55,10 @@ pub struct SessionViewResponse {
     /// uses this to open / create a MIDI clip in the slot and switch to the
     /// piano roll.
     pub slot_double_clicked: Option<(usize, usize)>,
+    /// User clicked the per-slot ▶/■/◆ launch button (Slice 9). The app
+    /// translates this to `LaunchClip` / `StopTrack` based on the slot's
+    /// current state.
+    pub slot_play_clicked: Option<(usize, usize)>,
     /// Scene launch button clicked
     pub scene_launched: Option<usize>,
     /// Track stop button clicked
@@ -281,8 +285,14 @@ impl<'a> SessionView<'a> {
                         // Clip slots for this scene
                         if let Some(row) = self.vm.slots.get(scene_idx) {
                             for slot in row {
-                                let slot_response = self.draw_slot(ui, slot, slot_width, slot_height);
-                                if slot_response.double_clicked() {
+                                let (slot_response, play_response) =
+                                    self.draw_slot(ui, slot, slot_width, slot_height);
+                                if play_response.map(|r| r.clicked()).unwrap_or(false) {
+                                    // Play button takes precedence over slot click;
+                                    // selection / piano-roll-open should not fire here.
+                                    response.slot_play_clicked =
+                                        Some((slot.track_index, slot.scene_index));
+                                } else if slot_response.double_clicked() {
                                     response.slot_double_clicked =
                                         Some((slot.track_index, slot.scene_index));
                                 } else if slot_response.clicked() {
@@ -312,8 +322,16 @@ impl<'a> SessionView<'a> {
         response
     }
 
-    /// Draw a single clip slot.
-    fn draw_slot(&self, ui: &mut egui::Ui, slot: &SlotViewModel, width: f32, height: f32) -> egui::Response {
+    /// Draw a single clip slot. Returns the slot's main response (used for
+    /// selection / double-click → piano roll) plus an optional play-button
+    /// response when the slot has a clip (Slice 9).
+    fn draw_slot(
+        &self,
+        ui: &mut egui::Ui,
+        slot: &SlotViewModel,
+        width: f32,
+        height: f32,
+    ) -> (egui::Response, Option<egui::Response>) {
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(width, height),
             egui::Sense::click(),
@@ -355,7 +373,7 @@ impl<'a> SessionView<'a> {
         }
 
         // Slot content
-        if let Some(clip) = &slot.clip {
+        let play_response = if let Some(clip) = &slot.clip {
             // Clip color bar
             painter.rect_filled(
                 egui::Rect::from_min_size(
@@ -366,30 +384,46 @@ impl<'a> SessionView<'a> {
                 color_to_egui(clip.color),
             );
 
-            // Clip name
+            // Clip name (left-shifted to leave room for the play button).
             painter.text(
-                rect.center(),
+                rect.center() - egui::vec2(8.0, 0.0),
                 egui::Align2::CENTER_CENTER,
                 &clip.name,
                 egui::FontId::proportional(11.0),
                 egui::Color32::WHITE,
             );
 
-            // State icon
-            let state_icon = slot.state_icon();
-            let icon_color = match slot.state {
-                SlotState::Playing => egui::Color32::from_rgb(76, 175, 80),
-                SlotState::Queued => egui::Color32::from_rgb(255, 193, 7),
-                SlotState::Recording => egui::Color32::from_rgb(244, 67, 54),
-                _ => egui::Color32::GRAY,
+            // Slice 9: per-slot launch button on the right edge of the slot.
+            // Symbol depends on state: ▶ to launch a stopped/empty-state clip,
+            // ■ to stop a playing clip, ◆ on a queued clip (click cancels).
+            let button_size = 20.0;
+            let play_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - button_size - 4.0, rect.top() + (height - button_size) / 2.0),
+                egui::vec2(button_size, button_size),
+            );
+            let pid = ui.id().with(("slot_play", slot.track_index, slot.scene_index));
+            let pr = ui.interact(play_rect, pid, egui::Sense::click());
+
+            let (icon, icon_color) = match slot.state {
+                SlotState::Playing => ("■", egui::Color32::from_rgb(76, 175, 80)),
+                SlotState::Queued => ("◆", egui::Color32::from_rgb(255, 193, 7)),
+                SlotState::Recording => ("●", egui::Color32::from_rgb(244, 67, 54)),
+                _ => ("▶", egui::Color32::from_gray(220)),
             };
-            painter.text(
-                rect.right_top() + egui::vec2(-12.0, 10.0),
+            let bg = if pr.hovered() {
+                egui::Color32::from_gray(80)
+            } else {
+                egui::Color32::from_gray(60)
+            };
+            ui.painter().rect_filled(play_rect, 3.0, bg);
+            ui.painter().text(
+                play_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                state_icon,
-                egui::FontId::proportional(12.0),
+                icon,
+                egui::FontId::proportional(13.0),
                 icon_color,
             );
+            Some(pr)
         } else {
             // Empty slot indicator
             painter.text(
@@ -399,9 +433,10 @@ impl<'a> SessionView<'a> {
                 egui::FontId::proportional(16.0),
                 egui::Color32::from_gray(80),
             );
-        }
+            None
+        };
 
-        response
+        (response, play_response)
     }
 }
 

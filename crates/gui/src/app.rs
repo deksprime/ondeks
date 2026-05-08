@@ -1,5 +1,6 @@
 //! Main application state and update loop.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -88,6 +89,12 @@ pub struct OndeksApp {
     /// MIDI notes that the piano roll preview-fired; we owe them a NoteOff
     /// at the corresponding `Instant` to avoid stuck-note voices.
     pending_preview_offs: Vec<(Instant, ondeks_core::NodeId, MidiPitch)>,
+
+    // ----- Slice 9: session-grid playback mirror -----
+    /// Mirror of the engine's launcher state, populated from
+    /// `RuntimeEvent::SlotStateChanged`. Drives the slot-icon coloring in the
+    /// session view; the engine remains the source of truth.
+    slot_states: HashMap<(usize, usize), SlotState>,
 }
 
 impl OndeksApp {
@@ -142,6 +149,7 @@ impl OndeksApp {
             piano_roll_selected: None,
             piano_roll_drag: DragState::default(),
             pending_preview_offs: Vec::new(),
+            slot_states: HashMap::new(),
         }
     }
 
@@ -198,7 +206,10 @@ impl OndeksApp {
 
     /// Poll for events from the audio runtime.
     fn poll_runtime_events(&mut self) {
-        for event in self.host.poll_events() {
+        // Collect first so we can call `&mut self` methods (rebuild view models)
+        // inside the per-event branches without borrowing `self.host` twice.
+        let events: Vec<_> = self.host.poll_events().collect();
+        for event in events {
             match event {
                 ondeks_runtime::queue::RuntimeEvent::MeterUpdate { left, right } => {
                     // Use a slower decay (0.95) so meters don't disappear too quickly
@@ -220,6 +231,14 @@ impl OndeksApp {
                     tracing::info!("UI: Transport state changed - is_playing: {}", is_playing);
                     self.transport_vm.is_playing = is_playing;
                 }
+                ondeks_runtime::queue::RuntimeEvent::SlotStateChanged { track, scene, state } => {
+                    if matches!(state, SlotState::Empty) {
+                        self.slot_states.remove(&(track, scene));
+                    } else {
+                        self.slot_states.insert((track, scene), state);
+                    }
+                    self.rebuild_view_models();
+                }
                 _ => {}
             }
         }
@@ -228,9 +247,17 @@ impl OndeksApp {
     /// Rebuild project and session view models from the current project.
     fn rebuild_view_models(&mut self) {
         self.project_vm = ProjectViewModel::from_project(&self.project);
+        // Snapshot the slot mirror so we don't borrow `self` twice when the
+        // closure runs.
+        let slot_states = self.slot_states.clone();
         self.session_vm = SessionViewModel::from_project(
             &self.project,
-            |_track, _scene| SlotState::Empty,
+            |track, scene| {
+                slot_states
+                    .get(&(track, scene))
+                    .copied()
+                    .unwrap_or(SlotState::Empty)
+            },
             |_track, _scene| false,
         );
     }
@@ -522,14 +549,17 @@ impl OndeksApp {
         if let Some((track_idx, scene_idx)) = response.slot_double_clicked {
             self.open_or_create_clip_in_slot(track_idx, scene_idx);
         }
+        if let Some((track, scene)) = response.slot_play_clicked {
+            self.toggle_slot_playback(track, scene);
+        }
         if let Some(scene) = response.scene_launched {
-            tracing::info!("Scene launched: {}", scene);
+            self.launch_scene(scene);
         }
         if let Some(track) = response.track_stopped {
-            tracing::info!("Track stopped: {}", track);
+            let _ = self.host.send_command(ondeks_core::Command::StopTrack { track });
         }
         if response.stop_all_clicked {
-            tracing::info!("Stop all clips");
+            let _ = self.host.send_command(ondeks_core::Command::StopAll);
         }
 
         // --- Track header actions ---
@@ -742,6 +772,51 @@ impl OndeksApp {
             self.piano_roll_selected = None;
             self.piano_roll_drag = DragState::default();
         }
+    }
+
+    /// Slice 9: handle a per-slot play-button click. If the slot is currently
+    /// playing or queued, send `StopTrack` (Ableton-style — one slot per
+    /// track, so stopping the slot stops the track). Otherwise build a
+    /// `ClipPlayback` snapshot and send `LaunchClip`. Auto-starts transport
+    /// if it's stopped so launches actually produce sound.
+    fn toggle_slot_playback(&mut self, track: usize, scene: usize) {
+        let current = self
+            .slot_states
+            .get(&(track, scene))
+            .copied()
+            .unwrap_or(SlotState::Empty);
+        if matches!(current, SlotState::Playing | SlotState::Queued) {
+            let _ = self.host.send_command(ondeks_core::Command::StopTrack { track });
+            return;
+        }
+        let Some(playback) = self.project.clip_playback_for_slot(track, scene) else {
+            tracing::info!("Slice 9: no clip in slot ({track}, {scene}); ignoring launch");
+            return;
+        };
+        if !self.transport_vm.is_playing {
+            let _ = self.host.send_command(ondeks_core::Command::Play);
+        }
+        let _ = self.host.send_command(ondeks_core::Command::LaunchClip {
+            track,
+            scene,
+            playback,
+        });
+    }
+
+    /// Slice 9: launch every non-empty slot in `scene_idx` at the next
+    /// quantize boundary. Auto-starts transport if stopped.
+    fn launch_scene(&mut self, scene_idx: usize) {
+        let playbacks = self.project.scene_playbacks(scene_idx);
+        if playbacks.is_empty() {
+            return;
+        }
+        if !self.transport_vm.is_playing {
+            let _ = self.host.send_command(ondeks_core::Command::Play);
+        }
+        let _ = self.host.send_command(ondeks_core::Command::LaunchScene {
+            scene: scene_idx,
+            playbacks,
+        });
     }
 
     /// Briefly trigger the track's instrument so the user hears the note

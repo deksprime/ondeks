@@ -2,9 +2,21 @@
 
 use super::registry::*;
 use crate::parser::ParsedCommand;
-use ondeks_core::session::{ViewMode, SlotState};
+use ondeks_core::session::{ClipPlayback, SlotState, ViewMode};
 use ondeks_core::transport::Beats;
+use ondeks_core::NodeId;
 use std::sync::Arc;
+
+/// Stub playback used for slots that have no playable clip (or no instrument).
+/// The launcher needs *some* playback to track state; the empty notes list
+/// produces no MIDI events when the engine advances it.
+fn stub_playback(length_beats: f64) -> ClipPlayback {
+    ClipPlayback {
+        target_node: NodeId::from_raw(0),
+        length_beats,
+        notes: Vec::new(),
+    }
+}
 
 pub fn register(registry: &mut CommandRegistry) {
     registry.register(
@@ -109,14 +121,19 @@ fn cmd_launch(ctx: &mut CommandContext, cmd: &ParsedCommand) -> CommandResult {
     }
     
     let ts_numerator = ctx.project.time_signature.numerator;
-    
+    let playback = ctx
+        .project
+        .clip_playback_for_slot(track - 1, scene - 1)
+        .unwrap_or_else(|| stub_playback(4.0));
+
     ctx.view_manager.session.launch_clip(
         track - 1,
         scene - 1,
+        playback,
         Beats(0.0), // Would need actual position
         ts_numerator,
     );
-    
+
     Ok(CommandOutput::text(format!("Launched clip at track {}, scene {}", track, scene)))
 }
 
@@ -130,16 +147,19 @@ fn cmd_launch_scene(ctx: &mut CommandContext, cmd: &ParsedCommand) -> CommandRes
         return Err("Scene index starts at 1".into());
     }
     
-    let _num_tracks = ctx.project.tracks().len();
     let ts_numerator = ctx.project.time_signature.numerator;
-    
-    ctx.view_manager.session.launch_scene(
-        scene - 1,
-        _num_tracks,
-        Beats(0.0),
-        ts_numerator,
-    );
-    
+    let scene_idx = scene - 1;
+
+    for (track_idx, playback) in ctx.project.scene_playbacks(scene_idx) {
+        ctx.view_manager.session.launch_clip(
+            track_idx,
+            scene_idx,
+            playback,
+            Beats(0.0),
+            ts_numerator,
+        );
+    }
+
     Ok(CommandOutput::text(format!("Launched scene {}", scene)))
 }
 

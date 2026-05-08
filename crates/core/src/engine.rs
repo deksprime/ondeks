@@ -6,7 +6,8 @@ use crate::dsp::StereoBuffer;
 use crate::graph::nodes::{ChannelStripNode, MasterStripNode, SynthNode};
 use crate::graph::{AudioGraph, AudioNode, GraphProcessor, PortAddress, ProcessContext};
 use crate::ids::NodeId;
-use crate::transport::Transport;
+use crate::session::{ClipLauncher, EngineMidiDispatch, SlotStateChange};
+use crate::transport::{Beats, Transport};
 
 /// The audio engine. One instance lives on the audio thread.
 pub struct Engine {
@@ -17,6 +18,12 @@ pub struct Engine {
     /// Master strip node. Sits between all per-track channel strips and the
     /// `OutputNode`; its gain is the master fader.
     master_strip_id: NodeId,
+    /// Session clip launcher. Owns slot states + active clip playback. Driven
+    /// every block by [`Self::process`].
+    clip_launcher: ClipLauncher,
+    /// Slot-state transitions waiting to be drained by the host into
+    /// `RuntimeEvent::SlotStateChanged`.
+    pending_state_changes: Vec<SlotStateChange>,
 }
 
 impl Engine {
@@ -64,11 +71,36 @@ impl Engine {
             transport: Transport::new(sample_rate),
             sample_rate,
             master_strip_id,
+            clip_launcher: ClipLauncher::new(),
+            pending_state_changes: Vec::new(),
         }
     }
 
     /// Process one block of audio.
     pub fn process(&mut self, output: &mut StereoBuffer, frames: u32) {
+        // Advance the clip launcher across this block, but only when the
+        // transport is rolling — otherwise queued clips would dequeue the
+        // moment they were enqueued (block_end == block_start with the
+        // transport stopped, which the launcher treats as "trigger time has
+        // passed"). Stopped transport ⇒ launcher idle.
+        if self.transport.is_playing() {
+            let block_start_beats = self.transport.position_beats();
+            let block_end_beats = block_start_beats
+                + Beats(frames as f64 / self.sample_rate as f64 * self.transport.tempo() / 60.0);
+
+            let advance = self.clip_launcher.advance(
+                block_start_beats,
+                block_end_beats,
+                self.transport.tempo(),
+                self.sample_rate,
+                frames,
+            );
+            for dispatch in advance.midi {
+                self.dispatch_midi(dispatch);
+            }
+            self.pending_state_changes.extend(advance.state_changes);
+        }
+
         let ctx = ProcessContext {
             buffer_size: frames as usize,
             sample_rate: self.sample_rate,
@@ -82,6 +114,28 @@ impl Engine {
 
         if self.transport.is_playing() {
             self.transport = self.transport.advance(frames as u64);
+        }
+    }
+
+    /// Drain any pending slot-state changes (LaunchClip → Queued, advance →
+    /// Playing, Stop* → Stopped). The runtime host calls this each block and
+    /// forwards each change as `RuntimeEvent::SlotStateChanged`.
+    pub fn drain_slot_state_changes(&mut self) -> Vec<SlotStateChange> {
+        std::mem::take(&mut self.pending_state_changes)
+    }
+
+    /// Read-only access to the clip launcher (slot states for assertions /
+    /// inspection from the same thread).
+    pub fn clip_launcher(&self) -> &ClipLauncher {
+        &self.clip_launcher
+    }
+
+    /// Route one clip-launcher MIDI dispatch into the target node's MIDI inbox.
+    /// No-op if the target node is missing (e.g., track was deleted while
+    /// playback continued — defensive only, the project lifecycle prevents it).
+    fn dispatch_midi(&mut self, dispatch: EngineMidiDispatch) {
+        if let Some(node) = self.graph.get_node_mut(dispatch.target) {
+            node.handle_midi(&dispatch.event, dispatch.sample_offset);
         }
     }
 
@@ -129,6 +183,51 @@ impl Engine {
                         master.set_volume_db(volume_db);
                     }
                 }
+            }
+            Command::LaunchClip { track, scene, playback } => {
+                let current_pos = self.transport.position_beats();
+                let ts_num = self.transport.time_signature().numerator;
+                let outcome =
+                    self.clip_launcher
+                        .launch_clip(track, scene, playback, current_pos, ts_num);
+                for dispatch in outcome.note_offs {
+                    self.dispatch_midi(dispatch);
+                }
+                self.pending_state_changes.extend(outcome.state_changes);
+            }
+            Command::StopTrack { track } => {
+                let outcome = self.clip_launcher.stop_track(track);
+                for dispatch in outcome.note_offs {
+                    self.dispatch_midi(dispatch);
+                }
+                self.pending_state_changes.extend(outcome.state_changes);
+            }
+            Command::LaunchScene { scene, playbacks } => {
+                let current_pos = self.transport.position_beats();
+                let ts_num = self.transport.time_signature().numerator;
+                for (track, playback) in playbacks {
+                    let outcome = self.clip_launcher.launch_clip(
+                        track,
+                        scene,
+                        playback,
+                        current_pos,
+                        ts_num,
+                    );
+                    for dispatch in outcome.note_offs {
+                        self.dispatch_midi(dispatch);
+                    }
+                    self.pending_state_changes.extend(outcome.state_changes);
+                }
+            }
+            Command::StopAll => {
+                let outcome = self.clip_launcher.stop_all();
+                for dispatch in outcome.note_offs {
+                    self.dispatch_midi(dispatch);
+                }
+                self.pending_state_changes.extend(outcome.state_changes);
+            }
+            Command::SetLaunchQuantize(quantize) => {
+                self.clip_launcher.quantize = quantize;
             }
         }
     }

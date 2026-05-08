@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use crate::ids::{TrackId, ClipId, SceneId};
+use crate::session::{ClipNote, ClipPlayback};
 use crate::transport::{TempoMap, TimeSignature, Beats};
 use crate::error::ProjectError;
 use super::track::{Track, TrackType};
@@ -306,6 +307,68 @@ impl Project {
     /// Get scene count.
     pub fn scene_count(&self) -> usize {
         self.scenes.len()
+    }
+
+    /// Build a [`ClipPlayback`] snapshot for the slot at
+    /// `(track_idx, scene_idx)`, with `track_idx` keyed against the
+    /// non-master track ordering used by the session view (master excluded,
+    /// stable order). Returns `None` if the slot is empty, the clip is
+    /// missing or audio, or the track has no instrument node.
+    pub fn clip_playback_for_slot(
+        &self,
+        track_idx: usize,
+        scene_idx: usize,
+    ) -> Option<ClipPlayback> {
+        let track = self.session_track(track_idx)?;
+        let target = track.instrument?;
+        let clip_id = (*track.session_slots.get(scene_idx)?)?;
+        let clip = self.get_clip(clip_id)?;
+        let midi = match clip {
+            Clip::Midi(m) => m,
+            _ => return None,
+        };
+        Some(ClipPlayback {
+            target_node: target,
+            length_beats: midi.header.length.0,
+            notes: midi
+                .notes
+                .iter()
+                .map(|n| ClipNote {
+                    start_beats: n.time.0,
+                    length_beats: n.length.0,
+                    pitch: n.pitch.raw(),
+                    velocity: n.velocity.raw(),
+                    channel: n.channel.raw(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Track at the given session-grid index — the i-th non-master track in
+    /// declaration order. The session view, the dispatcher and the engine all
+    /// agree on this indexing.
+    pub fn session_track(&self, track_idx: usize) -> Option<&Track> {
+        self.tracks
+            .iter()
+            .filter(|t| t.track_type != TrackType::Master)
+            .nth(track_idx)
+    }
+
+    /// Build playbacks for every non-empty slot in `scene_idx`. Used by
+    /// `Command::LaunchScene`.
+    pub fn scene_playbacks(&self, scene_idx: usize) -> Vec<(usize, ClipPlayback)> {
+        let mut out = Vec::new();
+        for (track_idx, _) in self
+            .tracks
+            .iter()
+            .filter(|t| t.track_type != TrackType::Master)
+            .enumerate()
+        {
+            if let Some(playback) = self.clip_playback_for_slot(track_idx, scene_idx) {
+                out.push((track_idx, playback));
+            }
+        }
+        out
     }
 }
 

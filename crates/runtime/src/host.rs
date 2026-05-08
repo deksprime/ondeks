@@ -136,6 +136,15 @@ impl Host {
             host_state.master_buffer.silence();
             host_state.engine.process(&mut host_state.master_buffer, frames as u32);
 
+            // Forward any session-slot state transitions from this block.
+            for change in host_state.engine.drain_slot_state_changes() {
+                event_sender.send(RuntimeEvent::SlotStateChanged {
+                    track: change.track,
+                    scene: change.scene,
+                    state: change.state,
+                });
+            }
+
             // Interleave master_buffer → CPAL output.
             let left = host_state.master_buffer.left().as_slice();
             let right = host_state.master_buffer.right().as_slice();
